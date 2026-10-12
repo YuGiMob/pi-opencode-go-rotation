@@ -1,7 +1,7 @@
 {
-  "name": "@lnilluv/pi-opencode-go-rotation",
+  "name": "@yugimob/pi-opencode-go-rotation",
   "version": "1.6.0",
-  "description": "Rotate between multiple OpenCode Go API keys with reactive 429, rate-limit, and watchdog stall detection",
+  "description": "Rotate between multiple OpenCode Go API keys with reactive 429, rate-limit, and watchdog stall detection, plus live footer usage for the active key",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -22,19 +22,28 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lnilluv/pi-opencode-go-rotation.git"
+    "url": "git+https://github.com/YuGiMob/pi-opencode-go-rotation.git"
   },
+  "homepage": "https://github.com/YuGiMob/pi-opencode-go-rotation#readme",
+  "bugs": {
+    "url": "https://github.com/YuGiMob/pi-opencode-go-rotation/issues"
+  },
+  "author": "Yugimob (https://github.com/YuGiMob)",
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": ">=0.71.1"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "keywords": [
     "pi-extension",
     "pi-package",
     "opencode",
     "api-key-rotation",
-    "rate-limit"
+    "rate-limit",
+    "usage"
   ],
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
     "@mariozechner/pi-coding-agent": "0.71.1",
     "typescript": "5.9.3"

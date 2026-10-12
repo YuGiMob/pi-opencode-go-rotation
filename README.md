@@ -2,10 +2,12 @@
 
 Rotate between multiple OpenCode Go API keys. The extension checks OpenCode Go usage when a 429 response arrives, rotates around quota-blocked and cooling-down keys, and recovers silent stalls detected by the watchdog.
 
+Fork of [lnilluv/pi-opencode-go-rotation](https://github.com/lnilluv/pi-opencode-go-rotation). This fork adds a live footer status line for the active key's OpenCode Go usage.
+
 ## Install
 
 ```bash
-pi install npm:@lnilluv/pi-opencode-go-rotation
+pi install npm:@yugimob/pi-opencode-go-rotation
 ```
 
 ## Setup
