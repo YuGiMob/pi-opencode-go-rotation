@@ -30,7 +30,13 @@
   },
   "author": "Yugimob (https://github.com/YuGiMob)",
   "peerDependencies": {
+    "@mariozechner/pi-coding-agent": ">=0.71.1",
     "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
   },
   "keywords": [
     "pi-extension",
