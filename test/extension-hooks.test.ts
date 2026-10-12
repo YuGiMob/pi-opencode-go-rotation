@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createOpencodeGoRotationExtension, parseOpenCodeGoUsage } from "../src/index.ts";
+import { createOpencodeGoRotationExtension, formatFooterUsage, parseOpenCodeGoUsage, shortUsageWindowLabel } from "../src/index.ts";
 
 interface FakeTimerEntry {
 	callback: () => void;
@@ -94,9 +94,10 @@ interface FakeContextState {
 	readonly runtimeKeys: string[];
 	readonly notifications: string[];
 	aborts: number;
+	readonly statuses: Array<{ key: string; text: string | undefined }>;
 }
 
-function createContext(state: FakeContextState, registryShape: "authStorage" | "runtime" = "authStorage"): ExtensionContext {
+function createContext(state: FakeContextState, registryShape: "authStorage" | "runtime" = "authStorage", withUi = false): ExtensionContext {
 	const keyStore = {
 		setRuntimeApiKey: (_provider: string, key: string) => {
 			state.runtimeKeys.push(key);
@@ -111,9 +112,13 @@ function createContext(state: FakeContextState, registryShape: "authStorage" | "
 			getApiKeyForProvider: async () => undefined,
 			[registryShape]: keyStore,
 		},
+		hasUI: withUi,
 		ui: {
 			notify: (message: string) => {
 				state.notifications.push(message);
+			},
+			setStatus: (key: string, text: string | undefined) => {
+				state.statuses.push({ key, text });
 			},
 		},
 		abort: () => {
@@ -196,12 +201,12 @@ async function withTempConfig(run: (configPath: string) => Promise<void>): Promi
 	}
 }
 
-function createHarness(registryShape: "authStorage" | "runtime" = "authStorage", fetch: FetchApi = async () => ({ ok: false, status: 404, json: async () => ({}) })): { pi: FakePi; ctx: ExtensionContext; state: FakeContextState; timers: FakeTimers; clock: FakeClock } {
+function createHarness(registryShape: "authStorage" | "runtime" = "authStorage", fetch: FetchApi = async () => ({ ok: false, status: 404, json: async () => ({}) }), withUi = false): { pi: FakePi; ctx: ExtensionContext; state: FakeContextState; timers: FakeTimers; clock: FakeClock } {
 	const timers = new FakeTimers();
 	const clock = new FakeClock();
 	const pi = new FakePi();
-	const state: FakeContextState = { runtimeKeys: [], notifications: [], aborts: 0 };
-	const ctx = createContext(state, registryShape);
+	const state: FakeContextState = { runtimeKeys: [], notifications: [], aborts: 0, statuses: [] };
+	const ctx = createContext(state, registryShape, withUi);
 	const extension = createOpencodeGoRotationExtension({ timers, clock, fetch });
 	extension(pi as unknown as ExtensionAPI);
 	return { pi, ctx, state, timers, clock };
@@ -233,6 +238,48 @@ test("usage helpers parse the upstream response shape", () => {
 		windows: [{ name: "5-hour", status: "active", usagePercent: 70, resetInSec: 8_100, used: 8.4, limit: 12 }],
 	});
 	assert.deepEqual(parseOpenCodeGoUsage({ windows: [{ name: "5-hour", status: "bad" }] }), { windows: [{ name: "5-hour", status: "unknown" }] });
+});
+
+test("usage footer formatting labels windows and reports errors", () => {
+	assert.equal(shortUsageWindowLabel("rolling", 0), "5h");
+	assert.equal(shortUsageWindowLabel("weekly", 1), "wk");
+	assert.equal(shortUsageWindowLabel("monthly", 2), "mo");
+	assert.equal(shortUsageWindowLabel(undefined, 3), "w4");
+	assert.equal(
+		formatFooterUsage("work", [
+			{ name: "rolling", status: "active", used: 3, limit: 12 },
+			{ name: "weekly", status: "active" },
+		]),
+		"opencode-go [work] 5h 25% · wk ?",
+	);
+	assert.equal(
+		formatFooterUsage("work", [{ name: "weekly", status: "rate-limited", usagePercent: 100 }]),
+		"opencode-go [work] wk 100% · rate-limited",
+	);
+	assert.equal(formatFooterUsage("work", [], "Usage request failed."), "opencode-go [work] Usage request failed.");
+	assert.equal(formatFooterUsage("work", []), "opencode-go [work] no usage data");
+});
+
+test("session start publishes footer usage and a model change clears it", async () => {
+	await withTempConfig(async () => {
+		const fetch: FetchApi = async () => usageResponse([
+			{ name: "rolling", status: "active", usagePercent: 12 },
+			{ name: "weekly", status: "active", usagePercent: 40 },
+			{ name: "monthly", status: "rate-limited", usagePercent: 100 },
+		]);
+		const { pi, ctx, state } = createHarness("authStorage", fetch, true);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.deepEqual(state.statuses.at(-1), {
+			key: "opencode-go-usage",
+			text: "opencode-go [one] 5h 12% · wk 40% · mo 100% · rate-limited",
+		});
+
+		(ctx as unknown as { model: { provider: string } }).model = { provider: "anthropic" };
+		await pi.emit("model_select", {}, ctx);
+		assert.deepEqual(state.statuses.at(-1), { key: "opencode-go-usage", text: undefined });
+	});
 });
 
 test("session start supports the current model registry runtime store", async () => {

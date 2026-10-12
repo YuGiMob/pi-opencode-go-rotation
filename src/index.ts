@@ -14,6 +14,10 @@ const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 const OPENCODE_GO_USAGE_TIMEOUT_MS = 10_000;
 const FIXED_WINDOW_QUOTA_RE = /\b(?:5[- ]hour|weekly|monthly)\b[\s\S]*\b(?:usage\s+)?(?:quota|limit)\b|\b(?:usage|plan)\s+allocated\s+quota\s+exceeded\b|\b(?:quota|limit)\b[\s\S]*\b(?:will\s+reset|resets?\s+at|fixed[- ]window)\b/i;
 const TRANSIENT_RATE_LIMIT_RE = /\b429\b|rate.?limit|too many requests|quota|usage limit|limit reached/i;
+const USAGE_STATUS_KEY = "opencode-go-usage";
+const USAGE_STATUS_REFRESH_MS = 60_000;
+const USAGE_STATUS_STALE_MS = 300_000;
+const USAGE_STATUS_DEBOUNCE_MS = 2_000;
 
 
 function getCooldownMs(config: Config): number {
@@ -737,6 +741,32 @@ export function formatUsageStatus(result: UsageFetchResult): string {
 	return [`OpenCode usage for ${result.keyName}:`, ...result.usage.windows.map(formatUsageWindow)].join("\n");
 }
 
+export function shortUsageWindowLabel(name: string | undefined, index: number): string {
+	if (!name) return `w${index + 1}`;
+	if (/roll|5.?h|hour/i.test(name)) return "5h";
+	if (/week|wk/i.test(name)) return "wk";
+	if (/month|mo/i.test(name)) return "mo";
+	return name;
+}
+
+export function formatFooterUsage(keyName: string, windows: OpenCodeGoUsageWindow[], error?: string): string {
+	if (error !== undefined) return `opencode-go [${keyName}] ${error}`;
+	if (windows.length === 0) return `opencode-go [${keyName}] no usage data`;
+	const parts = windows.map((window, index) => {
+		const label = shortUsageWindowLabel(window.name, index);
+		const percent = usageWindowPercent(window);
+		return `${label} ${percent === undefined ? "?" : `${Math.round(percent)}%`}`;
+	});
+	const rateLimited = windows.some((window) => window.status === "rate-limited");
+	return `opencode-go [${keyName}] ${parts.join(" · ")}${rateLimited ? " · rate-limited" : ""}`;
+}
+
+function usageWindowPercent(window: OpenCodeGoUsageWindow): number | undefined {
+	if (window.usagePercent !== undefined) return window.usagePercent;
+	if (window.used !== undefined && window.limit !== undefined && window.limit > 0) return (window.used / window.limit) * 100;
+	return undefined;
+}
+
 function formatStatus(config: Config, now = Date.now()): string {
 	const watchdogStatus = `Watchdog: ${config.watchdogEnabled ? "on" : "off"} (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)`;
 	if (config.keys.length === 0) {
@@ -815,6 +845,16 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		let usageDecisionEpoch = 0;
 		let requestRateLimitState: RequestRateLimitState | undefined;
 		const watchdogEvents: WatchdogEvent[] = [];
+		let usageStatusCtx: ExtensionContext | undefined;
+		let usageStatusTimer: unknown;
+		let usageStatusDebounce: unknown;
+		let usageStatusKeyIndex: number | undefined;
+		let usageStatusFetchedAt = 0;
+		let usageStatusInFlight: Promise<void> | undefined;
+		const statusTimerApi: TimerApi = options.timers ?? {
+			setTimeout: (callback, ms) => globalThis.setTimeout(callback, ms),
+			clearTimeout: (timer) => globalThis.clearTimeout(timer as Parameters<typeof globalThis.clearTimeout>[0]),
+		};
 
 		const now = (): number => options.clock?.now() ?? Date.now();
 		const fetchApi: FetchApi = options.fetch ?? globalThis.fetch.bind(globalThis);
@@ -852,6 +892,97 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			if (refreshConfig()) return true;
 			ctx.ui.notify(`OpenCode: ${configError}. No configuration was changed.`, "error");
 			return false;
+		}
+
+		function setUsageStatus(text: string | undefined): void {
+			const ctx = usageStatusCtx;
+			if (!ctx) return;
+			try {
+				if (ctx.hasUI) ctx.ui.setStatus(USAGE_STATUS_KEY, text);
+			} catch {
+				usageStatusCtx = undefined;
+			}
+		}
+
+		function stopUsageStatusTimer(): void {
+			if (usageStatusTimer !== undefined) {
+				statusTimerApi.clearTimeout(usageStatusTimer);
+				usageStatusTimer = undefined;
+			}
+			if (usageStatusDebounce !== undefined) {
+				statusTimerApi.clearTimeout(usageStatusDebounce);
+				usageStatusDebounce = undefined;
+			}
+		}
+
+		function startUsageStatusTimer(): void {
+			if (usageStatusTimer !== undefined) return;
+			usageStatusTimer = statusTimerApi.setTimeout(() => {
+				usageStatusTimer = undefined;
+				const ctx = usageStatusCtx;
+				if (!ctx || !ctx.hasUI || !shouldWatchProvider(ctx.model?.provider)) return;
+				fireUsageStatusRefresh(ctx);
+				startUsageStatusTimer();
+			}, USAGE_STATUS_STALE_MS);
+		}
+
+		function fireUsageStatusRefresh(ctx: ExtensionContext, force = false): void {
+			void refreshUsageStatus(ctx, force).catch(() => undefined);
+		}
+
+		function syncUsageStatus(ctx: ExtensionContext, force = false): void {
+			usageStatusCtx = ctx;
+			if (shouldWatchProvider(ctx.model?.provider)) {
+				startUsageStatusTimer();
+				fireUsageStatusRefresh(ctx, force);
+				return;
+			}
+			stopUsageStatusTimer();
+			setUsageStatus(undefined);
+		}
+
+		function scheduleUsageStatusRefresh(ctx: ExtensionContext): void {
+			usageStatusCtx = ctx;
+			if (!shouldWatchProvider(ctx.model?.provider)) {
+				stopUsageStatusTimer();
+				setUsageStatus(undefined);
+				return;
+			}
+			startUsageStatusTimer();
+			if (usageStatusDebounce !== undefined) statusTimerApi.clearTimeout(usageStatusDebounce);
+			usageStatusDebounce = statusTimerApi.setTimeout(() => {
+				usageStatusDebounce = undefined;
+				fireUsageStatusRefresh(ctx);
+			}, USAGE_STATUS_DEBOUNCE_MS);
+		}
+
+		async function refreshUsageStatus(ctx: ExtensionContext, force = false): Promise<void> {
+			usageStatusCtx = ctx;
+			if (!ctx.hasUI) return;
+			if (!refreshConfig()) return;
+			const target = getActiveUsageTarget(config);
+			if (!target) {
+				setUsageStatus("opencode-go: no keys configured");
+				return;
+			}
+			const currentTime = now();
+			const keyChanged = target.keyIndex !== usageStatusKeyIndex;
+			if (!force && !keyChanged && currentTime - usageStatusFetchedAt < USAGE_STATUS_REFRESH_MS) return;
+			if (usageStatusInFlight) return;
+			const request = (async (): Promise<void> => {
+				const usage = await fetchOpenCodeGoUsage(target, fetchApi, options.timers);
+				usageStatusKeyIndex = target.keyIndex;
+				usageStatusFetchedAt = now();
+				if (usageStatusCtx !== ctx) return;
+				if (!refreshConfig() || getActiveUsageTarget(config)?.keyIndex !== target.keyIndex) return;
+				setUsageStatus(usage.ok ? formatFooterUsage(target.keyName, usage.usage.windows) : formatFooterUsage(target.keyName, [], usage.message));
+			})();
+			usageStatusInFlight = request;
+			try {
+				await request;
+			} finally {
+				if (usageStatusInFlight === request) usageStatusInFlight = undefined;
+			}
 		}
 
 		function applySynchronizedActiveKey(ctx: Pick<ExtensionContext, "modelRegistry">): string | undefined {
@@ -1138,6 +1269,9 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			invalidateAutomaticDecisions();
 			requestRateLimitState = undefined;
 			clearWatchdogTimeoutGuard();
+			setUsageStatus(undefined);
+			stopUsageStatusTimer();
+			usageStatusCtx = ctx;
 			if (!ensureConfig(ctx)) return;
 			// A block recorded in an earlier session can be stale: the plan was topped up, or the
 			// window reset before the deadline we stored. Re-check before it decides which key this
@@ -1161,6 +1295,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			if (event.reason === "reload") {
 				const keyName = applySynchronizedActiveKey(ctx);
 				if (keyName) ctx.ui.notify(`OpenCode: Active key → ${keyName}`, "info");
+				syncUsageStatus(ctx, true);
 				return;
 			}
 			if (config.keys.length === 0) {
@@ -1172,14 +1307,21 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 					return;
 				} else {
 					ctx.ui.notify("OpenCode: No keys configured. Use /opencode add <name> <key>", "warning");
+					setUsageStatus(undefined);
 					return;
 				}
 			}
 			const keyName = applySynchronizedActiveKey(ctx);
 			if (keyName) ctx.ui.notify(`OpenCode: Active key → ${keyName}`, "info");
+			syncUsageStatus(ctx, true);
+		});
+
+		pi.on("model_select", (_event, ctx) => {
+			syncUsageStatus(ctx, true);
 		});
 
 		pi.on("before_provider_request", (event, ctx) => {
+			syncUsageStatus(ctx);
 			if (!shouldWatchProvider(ctx.model?.provider)) {
 				invalidateAutomaticDecisions();
 				requestRateLimitState = undefined;
@@ -1437,6 +1579,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 						}
 						const keyName = applyActiveKey(config, ctx.modelRegistry, now());
 						ctx.ui.notify(`Switched to ${keyName}`, "info");
+						syncUsageStatus(ctx, true);
 						break;
 					}
 
@@ -1459,6 +1602,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 						}
 						const keyName = applyActiveKey(config, ctx.modelRegistry, now());
 						ctx.ui.notify(`Switched to ${keyName}`, "info");
+						syncUsageStatus(ctx, true);
 						break;
 					}
 
@@ -1481,6 +1625,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 						}
 						if (count === 1) applyActiveKey(config, ctx.modelRegistry, now());
 						ctx.ui.notify(`Added "${name}" (${count} keys)`, "info");
+						syncUsageStatus(ctx, true);
 						break;
 					}
 
@@ -1513,6 +1658,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 							ignoreAsyncRefresh(getRuntimeKeyStore(ctx.modelRegistry).removeRuntimeApiKey(PROVIDER));
 						}
 						ctx.ui.notify(`Removed "${result.removedName}" (${result.count} left)`, "info");
+						syncUsageStatus(ctx, true);
 						break;
 					}
 
@@ -1528,6 +1674,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 							return;
 						}
 						ctx.ui.notify("All cooldowns and quota blocks cleared", "info");
+						syncUsageStatus(ctx, true);
 						break;
 					}
 
@@ -1608,11 +1755,15 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			clearWatchdogTimeoutGuard();
 		}
 
-		pi.on("agent_end", () => {
+		pi.on("agent_end", (_event, ctx) => {
 			cleanupLifecycleState();
+			scheduleUsageStatusRefresh(ctx);
 		});
 
 		pi.on("session_shutdown", () => {
+			stopUsageStatusTimer();
+			setUsageStatus(undefined);
+			usageStatusCtx = undefined;
 			cleanupLifecycleState();
 		});
 	};

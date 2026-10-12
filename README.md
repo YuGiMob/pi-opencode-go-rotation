@@ -40,6 +40,16 @@ Cooldowns default to 60 minutes. Quota blocks expire at their persisted deadline
 
 Usage commands use `https://opencode.ai/zen/go/v1/usage` and stop waiting after 10 seconds. A timeout reports `Usage request timed out after 10s.`.
 
+## Footer usage
+
+While the selected model uses the `opencode-go` provider, the extension keeps a status line in pi's footer with the active key and its Go windows:
+
+```text
+opencode-go [personal] 5h 12% · wk 40% · mo 55%
+```
+
+It refreshes on session start, model changes, turns, key rotations, manual key commands, and every 5 minutes. Switching to another provider clears the line.
+
 ## Commands
 
 | Command | Description |
