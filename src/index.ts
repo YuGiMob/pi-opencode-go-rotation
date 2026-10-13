@@ -749,16 +749,43 @@ export function shortUsageWindowLabel(name: string | undefined, index: number): 
 	return name;
 }
 
-export function formatFooterUsage(keyName: string, windows: OpenCodeGoUsageWindow[], error?: string): string {
-	if (error !== undefined) return `opencode-go [${keyName}] ${error}`;
-	if (windows.length === 0) return `opencode-go [${keyName}] no usage data`;
+export interface FooterUsageOptions {
+	keyName?: string;
+	nowMs?: number;
+	error?: string;
+}
+
+export function formatFooterUsage(windows: OpenCodeGoUsageWindow[], options: FooterUsageOptions = {}): string {
+	const prefix = `${options.keyName ?? "opencode-go"} · `;
+	if (options.error !== undefined) return `${prefix}usage unavailable: ${options.error}`;
+	if (windows.length === 0) return `${prefix}no usage windows`;
 	const parts = windows.map((window, index) => {
 		const label = shortUsageWindowLabel(window.name, index);
 		const percent = usageWindowPercent(window);
 		return `${label} ${percent === undefined ? "?" : `${Math.round(percent)}%`}`;
 	});
 	const rateLimited = windows.some((window) => window.status === "rate-limited");
-	return `opencode-go [${keyName}] ${parts.join(" · ")}${rateLimited ? " · rate-limited" : ""}`;
+	const renewal = monthlyRenewalDate(windows, options.nowMs ?? Date.now());
+	return `${prefix}${parts.join(" · ")}${rateLimited ? " · rate-limited" : ""}${renewal === undefined ? "" : ` | ↻ ${formatRenewalDate(renewal)}`}`;
+}
+
+function monthlyRenewalDate(windows: OpenCodeGoUsageWindow[], nowMs: number): number | undefined {
+	const monthly = windows.find((window, index) => shortUsageWindowLabel(window.name, index) === "mo");
+	if (!monthly) return undefined;
+	for (const value of [monthly.resetAt, monthly.endAt]) {
+		if (!value) continue;
+		const parsed = Date.parse(value);
+		if (Number.isFinite(parsed)) return parsed;
+	}
+	if (monthly.resetInSec !== undefined && Number.isFinite(monthly.resetInSec)) return nowMs + monthly.resetInSec * 1000;
+	return undefined;
+}
+
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+function formatRenewalDate(ms: number): string {
+	const date = new Date(ms);
+	return `${MONTH_NAMES[date.getUTCMonth()]} ${date.getUTCDate()}`;
 }
 
 function usageWindowPercent(window: OpenCodeGoUsageWindow): number | undefined {
@@ -975,7 +1002,9 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				usageStatusFetchedAt = now();
 				if (usageStatusCtx !== ctx) return;
 				if (!refreshConfig() || getActiveUsageTarget(config)?.keyIndex !== target.keyIndex) return;
-				setUsageStatus(usage.ok ? formatFooterUsage(target.keyName, usage.usage.windows) : formatFooterUsage(target.keyName, [], usage.message));
+				setUsageStatus(usage.ok
+					? formatFooterUsage(usage.usage.windows, { keyName: target.keyName, nowMs: currentTime })
+					: formatFooterUsage([], { keyName: target.keyName, nowMs: currentTime, error: usage.message }));
 			})();
 			usageStatusInFlight = request;
 			try {

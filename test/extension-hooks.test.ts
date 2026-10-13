@@ -246,18 +246,38 @@ test("usage footer formatting labels windows and reports errors", () => {
 	assert.equal(shortUsageWindowLabel("monthly", 2), "mo");
 	assert.equal(shortUsageWindowLabel(undefined, 3), "w4");
 	assert.equal(
-		formatFooterUsage("work", [
-			{ name: "rolling", status: "active", used: 3, limit: 12 },
-			{ name: "weekly", status: "active" },
-		]),
-		"opencode-go [work] 5h 25% · wk ?",
+		formatFooterUsage(
+			[
+				{ name: "rolling", status: "active", used: 3, limit: 12 },
+				{ name: "weekly", status: "active" },
+			],
+			{ keyName: "work" },
+		),
+		"work · 5h 25% · wk ?",
 	);
 	assert.equal(
-		formatFooterUsage("work", [{ name: "weekly", status: "rate-limited", usagePercent: 100 }]),
-		"opencode-go [work] wk 100% · rate-limited",
+		formatFooterUsage([{ name: "weekly", status: "rate-limited", usagePercent: 100 }], { keyName: "work" }),
+		"work · wk 100% · rate-limited",
 	);
-	assert.equal(formatFooterUsage("work", [], "Usage request failed."), "opencode-go [work] Usage request failed.");
-	assert.equal(formatFooterUsage("work", []), "opencode-go [work] no usage data");
+	assert.equal(
+		formatFooterUsage(
+			[{ name: "monthly", status: "active", usagePercent: 70, resetAt: "2026-11-12T12:00:00Z" }],
+			{ keyName: "work", nowMs: Date.parse("2026-10-12T12:00:00Z") },
+		),
+		"work · mo 70% | ↻ Nov 12",
+	);
+	assert.equal(
+		formatFooterUsage(
+			[{ name: "monthly", status: "active", usagePercent: 70, resetInSec: 86_400 }],
+			{ keyName: "work", nowMs: Date.parse("2026-11-11T12:00:00Z") },
+		),
+		"work · mo 70% | ↻ Nov 12",
+	);
+	assert.equal(
+		formatFooterUsage([], { nowMs: 0, error: "Usage request failed." }),
+		"opencode-go · usage unavailable: Usage request failed.",
+	);
+	assert.equal(formatFooterUsage([], { nowMs: 0 }), "opencode-go · no usage windows");
 });
 
 test("session start publishes footer usage and a model change clears it", async () => {
@@ -265,7 +285,7 @@ test("session start publishes footer usage and a model change clears it", async 
 		const fetch: FetchApi = async () => usageResponse([
 			{ name: "rolling", status: "active", usagePercent: 12 },
 			{ name: "weekly", status: "active", usagePercent: 40 },
-			{ name: "monthly", status: "rate-limited", usagePercent: 100 },
+			{ name: "monthly", status: "rate-limited", usagePercent: 100, resetAt: "2026-11-12T00:00:00Z" },
 		]);
 		const { pi, ctx, state } = createHarness("authStorage", fetch, true);
 
@@ -273,7 +293,7 @@ test("session start publishes footer usage and a model change clears it", async 
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		assert.deepEqual(state.statuses.at(-1), {
 			key: "opencode-go-usage",
-			text: "opencode-go [one] 5h 12% · wk 40% · mo 100% · rate-limited",
+			text: "one · 5h 12% · wk 40% · mo 100% · rate-limited | ↻ Nov 12",
 		});
 
 		(ctx as unknown as { model: { provider: string } }).model = { provider: "anthropic" };

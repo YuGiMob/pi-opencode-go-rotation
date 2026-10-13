@@ -606,18 +606,40 @@ export function shortUsageWindowLabel(name, index) {
         return "mo";
     return name;
 }
-export function formatFooterUsage(keyName, windows, error) {
-    if (error !== undefined)
-        return `opencode-go [${keyName}] ${error}`;
+export function formatFooterUsage(windows, options = {}) {
+    const prefix = `${options.keyName ?? "opencode-go"} · `;
+    if (options.error !== undefined)
+        return `${prefix}usage unavailable: ${options.error}`;
     if (windows.length === 0)
-        return `opencode-go [${keyName}] no usage data`;
+        return `${prefix}no usage windows`;
     const parts = windows.map((window, index) => {
         const label = shortUsageWindowLabel(window.name, index);
         const percent = usageWindowPercent(window);
         return `${label} ${percent === undefined ? "?" : `${Math.round(percent)}%`}`;
     });
     const rateLimited = windows.some((window) => window.status === "rate-limited");
-    return `opencode-go [${keyName}] ${parts.join(" · ")}${rateLimited ? " · rate-limited" : ""}`;
+    const renewal = monthlyRenewalDate(windows, options.nowMs ?? Date.now());
+    return `${prefix}${parts.join(" · ")}${rateLimited ? " · rate-limited" : ""}${renewal === undefined ? "" : ` | ↻ ${formatRenewalDate(renewal)}`}`;
+}
+function monthlyRenewalDate(windows, nowMs) {
+    const monthly = windows.find((window, index) => shortUsageWindowLabel(window.name, index) === "mo");
+    if (!monthly)
+        return undefined;
+    for (const value of [monthly.resetAt, monthly.endAt]) {
+        if (!value)
+            continue;
+        const parsed = Date.parse(value);
+        if (Number.isFinite(parsed))
+            return parsed;
+    }
+    if (monthly.resetInSec !== undefined && Number.isFinite(monthly.resetInSec))
+        return nowMs + monthly.resetInSec * 1000;
+    return undefined;
+}
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+function formatRenewalDate(ms) {
+    const date = new Date(ms);
+    return `${MONTH_NAMES[date.getUTCMonth()]} ${date.getUTCDate()}`;
 }
 function usageWindowPercent(window) {
     if (window.usagePercent !== undefined)
@@ -825,7 +847,9 @@ export function createOpencodeGoRotationExtension(options = {}) {
                     return;
                 if (!refreshConfig() || getActiveUsageTarget(config)?.keyIndex !== target.keyIndex)
                     return;
-                setUsageStatus(usage.ok ? formatFooterUsage(target.keyName, usage.usage.windows) : formatFooterUsage(target.keyName, [], usage.message));
+                setUsageStatus(usage.ok
+                    ? formatFooterUsage(usage.usage.windows, { keyName: target.keyName, nowMs: currentTime })
+                    : formatFooterUsage([], { keyName: target.keyName, nowMs: currentTime, error: usage.message }));
             })();
             usageStatusInFlight = request;
             try {

@@ -91,7 +91,12 @@ export declare function parseOpenCodeGoUsage(value: unknown): OpenCodeGoUsageRes
 export declare function formatResetIn(seconds: number): string;
 export declare function formatUsageStatus(result: UsageFetchResult): string;
 export declare function shortUsageWindowLabel(name: string | undefined, index: number): string;
-export declare function formatFooterUsage(keyName: string, windows: OpenCodeGoUsageWindow[], error?: string): string;
+export interface FooterUsageOptions {
+    keyName?: string;
+    nowMs?: number;
+    error?: string;
+}
+export declare function formatFooterUsage(windows: OpenCodeGoUsageWindow[], options?: FooterUsageOptions): string;
 export declare function createOpencodeGoRotationExtension(options?: ExtensionOptions): (pi: ExtensionAPI) => void;
 declare const extension: (pi: ExtensionAPI) => void;
 export default extension;

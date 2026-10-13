@@ -44,13 +44,13 @@ Usage commands use `https://opencode.ai/zen/go/v1/usage` and stop waiting after 
 
 ## Footer usage
 
-While the selected model uses the `opencode-go` provider, the extension keeps a status line in pi's footer with the active key and its Go windows:
+While the selected model uses the `opencode-go` provider, the extension keeps a status line in pi's footer with the active key's name, the usage windows, and the monthly renewal date:
 
 ```text
-opencode-go [personal] 5h 12% · wk 40% · mo 55%
+personal · 5h 12% · wk 40% · mo 55% | ↻ Nov 12
 ```
 
-It refreshes on session start, model changes, turns, key rotations, manual key commands, and every 5 minutes. Switching to another provider clears the line.
+It refreshes on session start, model changes, turns, key rotations, manual key commands, and every 5 minutes. The active key's name leads the line, and switching to another provider clears it.
 
 ## Commands
 
