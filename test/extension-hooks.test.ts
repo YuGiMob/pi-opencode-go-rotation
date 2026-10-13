@@ -1394,6 +1394,36 @@ test("recovery clears a blocked key with confirmed headroom and rotates to it", 
 	});
 });
 
+test("quota recovery probes every blocked key at the same time", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { quotaBlockedUntil: { 1: 9_999_999, 2: 9_999_999 } });
+		const pending: Array<(response: Awaited<ReturnType<FetchApi>>) => void> = [];
+		const authorizations: string[] = [];
+		const fetch: FetchApi = async (_url, init) => {
+			authorizations.push(init.headers.Authorization ?? "");
+			return await new Promise<Awaited<ReturnType<FetchApi>>>((resolve) => {
+				pending.push(resolve);
+			});
+		};
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		const event = pi.emit("message_end", assistantError(transientError), ctx);
+
+		assert.equal(pending.length, 2, "both blocked keys must be probed before either response arrives");
+
+		for (const resolve of pending) resolve(activeUsage());
+		await event;
+
+		assert.deepEqual(authorizations, ["Bearer sk-two", "Bearer sk-three"]);
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, {});
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.match(state.notifications.join("\n"), /two has headroom again/);
+		assert.match(state.notifications.join("\n"), /three has headroom again/);
+	});
+});
+
 test("late transient recovery cannot override a manual key selection", async () => {
 	await withTempConfig(async (configPath) => {
 		patchConfig(configPath, { keys: twoKeys, quotaBlockedUntil: { 1: 9_999_999 } });

@@ -922,16 +922,13 @@ export function createOpencodeGoRotationExtension(options = {}) {
             const candidates = getQuotaBlockedTargets(config, currentTime, skipKeyIndex)
                 .map((target) => captureSelectionSnapshot(config, currentTime, target.keyIndex))
                 .filter((snapshot) => snapshot !== undefined);
-            const recovered = [];
-            for (const candidate of candidates) {
+            const results = await Promise.all(candidates.map(async (candidate) => {
                 const usage = await fetchOpenCodeGoUsage(candidate, fetchApi, options.timers);
-                if (hasConfirmedHeadroom(usage))
-                    recovered.push(candidate);
-                // Keep the in-memory config aligned with writers active during the probes.
-                if (!refreshConfig())
-                    break;
-            }
-            return recovered;
+                return hasConfirmedHeadroom(usage) ? candidate : undefined;
+            }));
+            if (!refreshConfig())
+                return [];
+            return results.filter((snapshot) => snapshot !== undefined);
         }
         function selectNextKey(mode, freshConfig, startIndex, currentTime) {
             return mode.kind === "quota"
