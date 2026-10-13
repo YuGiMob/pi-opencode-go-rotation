@@ -1175,9 +1175,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
             }
             // On reload: re-apply active key, skip auto-import
             if (event.reason === "reload") {
-                const keyName = applySynchronizedActiveKey(ctx);
-                if (keyName)
-                    ctx.ui.notify(`OpenCode: Active key → ${keyName}`, "info");
+                applySynchronizedActiveKey(ctx);
                 syncUsageStatus(ctx, true);
                 return;
             }
@@ -1197,9 +1195,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
                     return;
                 }
             }
-            const keyName = applySynchronizedActiveKey(ctx);
-            if (keyName)
-                ctx.ui.notify(`OpenCode: Active key → ${keyName}`, "info");
+            applySynchronizedActiveKey(ctx);
             syncUsageStatus(ctx, true);
         });
         pi.on("model_select", (_event, ctx) => {
