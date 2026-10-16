@@ -132,20 +132,6 @@ function getQuotaBlockedUntil(config, keyIndex, now) {
         ? blockedUntil
         : undefined;
 }
-/** Keys held by a live recorded block, optionally ignoring the key that just failed. */
-function getQuotaBlockedTargets(config, now, skipKeyIndex) {
-    const targets = [];
-    for (let keyIndex = 0; keyIndex < config.keys.length; keyIndex++) {
-        if (keyIndex === skipKeyIndex)
-            continue;
-        if (getQuotaBlockedUntil(config, keyIndex, now) === undefined)
-            continue;
-        const target = getUsageTargetForKeyIndex(config, keyIndex);
-        if (target)
-            targets.push(target);
-    }
-    return targets;
-}
 function pickAvailableKeyIndex(config, now = Date.now()) {
     const cdMs = getCooldownMs(config);
     for (let i = 0; i < config.keys.length; i++) {
@@ -158,25 +144,43 @@ function pickAvailableKeyIndex(config, now = Date.now()) {
     }
     return undefined;
 }
+function listRotationCandidates(config, startIndex, currentTime) {
+    const preferred = [];
+    const cooling = [];
+    const cooldownMs = getCooldownMs(config);
+    for (let offset = 1; offset < config.keys.length; offset++) {
+        const keyIndex = (startIndex + offset) % config.keys.length;
+        if (getQuotaBlockedUntil(config, keyIndex, currentTime) !== undefined)
+            continue;
+        const cooldownStart = config.cooldowns[keyIndex];
+        if (cooldownStart === undefined || currentTime - cooldownStart >= cooldownMs)
+            preferred.push(keyIndex);
+        else
+            cooling.push(keyIndex);
+    }
+    return [...preferred, ...cooling];
+}
+function applyRotationMode(mode, config, keyIndex, currentTime) {
+    if (mode.kind === "quota") {
+        if (mode.authoritative)
+            config.quotaBlockedUntil[keyIndex] = mode.blockedUntil;
+        else
+            setQuotaBlock(config, keyIndex, mode.blockedUntil, currentTime);
+        return;
+    }
+    config.cooldowns[keyIndex] = currentTime;
+}
 function rotateToNextKey(config, options = {}) {
     if (config.keys.length === 0)
         return undefined;
     const now = options.now ?? Date.now();
     config.cooldowns[config.activeKeyIndex] = now;
-    const next = pickAvailableKeyIndex(config, now);
-    if (next !== undefined) {
-        config.activeKeyIndex = next;
-        return next;
-    }
-    for (let offset = 1; offset <= config.keys.length; offset++) {
-        const candidate = (config.activeKeyIndex + offset) % config.keys.length;
-        if (getQuotaBlockedUntil(config, candidate, now) !== undefined)
-            continue;
-        config.activeKeyIndex = candidate;
-        delete config.cooldowns[candidate];
-        return candidate;
-    }
-    return undefined;
+    const next = listRotationCandidates(config, config.activeKeyIndex, now)[0];
+    if (next === undefined)
+        return undefined;
+    config.activeKeyIndex = next;
+    delete config.cooldowns[next];
+    return next;
 }
 // Key equality detects credential changes, but persisted history has no issuer
 // provenance (including after reload). Never replay signed reasoning on this
@@ -470,24 +474,22 @@ function matchesUsageTarget(config, target) {
         && (entry.name || `key-${target.keyIndex + 1}`) === target.keyName
         && entry.key === target.bearerToken;
 }
-function hasRateLimitedUsageWindow(result) {
-    return result.ok && result.usage.windows.some((window) => window.status === "rate-limited");
+function usageWindowExhausted(window) {
+    if (window.status === "rate-limited")
+        return true;
+    if (window.usagePercent !== undefined && window.usagePercent >= 100)
+        return true;
+    if (window.used !== undefined && window.limit !== undefined && window.limit > 0 && window.used >= window.limit)
+        return true;
+    return window.remaining !== undefined && window.remaining <= 0;
 }
-/**
- * A recorded block can go stale: the plan was topped up, or the window reset before the
- * deadline we stored. Only a clean reading releases it -- a failed or unrecognised usage
- * response is not evidence of headroom. A response with no windows, or with any window
- * that is not positively active, stays conservative and keeps the recorded block.
- */
-function hasConfirmedHeadroom(result) {
-    return result.ok
-        && result.usage.windows.length > 0
-        && result.usage.windows.every((window) => window.status === "active");
+function hasExhaustedWindow(result) {
+    return result.ok && result.usage.windows.some(usageWindowExhausted);
 }
-function getRateLimitedUntil(usage, now, fallbackMs) {
+function getExhaustedUntil(usage, now, fallbackMs) {
     let blockedUntil = now;
     for (const window of usage.windows) {
-        if (window.status !== "rate-limited")
+        if (!usageWindowExhausted(window))
             continue;
         const resetTimes = [];
         if (window.resetInSec !== undefined) {
@@ -521,28 +523,6 @@ function getEarliestQuotaReset(config, now) {
 }
 function setQuotaBlock(config, keyIndex, blockedUntil, now) {
     config.quotaBlockedUntil[keyIndex] = Math.max(getQuotaBlockedUntil(config, keyIndex, now) ?? 0, blockedUntil);
-}
-function blockQuotaAndSelectNext(config, keyIndex, blockedUntil, now, isAuthoritative = false) {
-    if (isAuthoritative) {
-        config.quotaBlockedUntil[keyIndex] = blockedUntil;
-    }
-    else {
-        setQuotaBlock(config, keyIndex, blockedUntil, now);
-    }
-    let next = pickAvailableKeyIndex(config, now);
-    if (next === undefined) {
-        for (let offset = 1; offset <= config.keys.length; offset++) {
-            const candidate = (keyIndex + offset) % config.keys.length;
-            if (getQuotaBlockedUntil(config, candidate, now) !== undefined)
-                continue;
-            next = candidate;
-            delete config.cooldowns[candidate];
-            break;
-        }
-    }
-    if (next !== undefined)
-        config.activeKeyIndex = next;
-    return next;
 }
 function formatUsageAmount(value) {
     return value === undefined ? undefined : value.toLocaleString("en-US");
@@ -822,15 +802,25 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 return;
             const request = (async () => {
                 const usage = await fetchOpenCodeGoUsage(target, fetchApi, options.timers);
+                const receivedAt = now();
                 usageStatusKeyIndex = target.keyIndex;
-                usageStatusFetchedAt = now();
+                usageStatusFetchedAt = receivedAt;
                 if (usageStatusCtx !== ctx)
                     return;
                 if (!refreshConfig() || getActiveUsageTarget(config)?.keyIndex !== target.keyIndex)
                     return;
+                if (usage.ok && hasExhaustedWindow(usage) && getQuotaBlockedUntil(config, target.keyIndex, receivedAt) === undefined) {
+                    mutateSharedConfig((freshConfig) => {
+                        if (!matchesUsageTarget(freshConfig, target))
+                            return;
+                        if (getQuotaBlockedUntil(freshConfig, target.keyIndex, receivedAt) !== undefined)
+                            return;
+                        setQuotaBlock(freshConfig, target.keyIndex, getExhaustedUntil(usage.usage, receivedAt, getCooldownMs(freshConfig)), receivedAt);
+                    });
+                }
                 setUsageStatus(usage.ok
-                    ? formatFooterUsage(usage.usage.windows, { keyName: target.keyName, nowMs: currentTime })
-                    : formatFooterUsage([], { keyName: target.keyName, nowMs: currentTime, error: usage.message }));
+                    ? formatFooterUsage(usage.usage.windows, { keyName: target.keyName, nowMs: receivedAt })
+                    : formatFooterUsage([], { keyName: target.keyName, nowMs: receivedAt, error: usage.message }));
             })();
             usageStatusInFlight = request;
             try {
@@ -891,128 +881,68 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 && refreshConfig()
                 && isRotationOperationCurrent(outcome.completion, config, usageDecisionEpoch);
         }
-        /**
-         * A benched key can become usable again after we recorded its block. Probe the blocked
-         * keys without mutating anything; only a positive reading is collected as candidate
-         * headroom. The probes are data-only, so a stale result can never be applied without the
-         * guarded commit re-checking the credential, block and cooldown it was sampled from.
-         */
-        async function probeRecoveredHeadroom(currentTime, skipKeyIndex) {
-            if (!refreshConfig())
-                return [];
-            const candidates = getQuotaBlockedTargets(config, currentTime, skipKeyIndex)
-                .map((target) => captureSelectionSnapshot(config, currentTime, target.keyIndex))
-                .filter((snapshot) => snapshot !== undefined);
-            const results = await Promise.all(candidates.map(async (candidate) => {
-                const usage = await fetchOpenCodeGoUsage(candidate, fetchApi, options.timers);
-                return hasConfirmedHeadroom(usage) ? candidate : undefined;
-            }));
-            if (!refreshConfig())
-                return [];
-            return results.filter((snapshot) => snapshot !== undefined);
-        }
-        function selectNextKey(mode, freshConfig, startIndex, currentTime) {
-            return mode.kind === "quota"
-                ? blockQuotaAndSelectNext(freshConfig, startIndex, mode.blockedUntil, currentTime, mode.authoritative)
-                : rotateToNextKey(freshConfig, { now: currentTime });
-        }
-        /**
-         * Block the failed key and select a replacement, re-probing benched keys only when the
-         * fast path found nothing. Every mutation re-validates the operation snapshot under the
-         * lock, so a decision invalidated while probes were in flight is cancelled instead of
-         * being rebased onto the newer state.
-         */
-        async function rotateWithRecovery(ctx, operation, currentTime, mode) {
+        async function rotateWithRecovery(operation, currentTime, mode) {
             const startIndex = operation.selection.keyIndex;
-            const fast = mutateSharedConfig((freshConfig) => {
-                if (!isRotationOperationCurrent(operation, freshConfig, usageDecisionEpoch)) {
-                    return { outcome: "cancelled" };
-                }
-                return { outcome: "done", value: selectNextKey(mode, freshConfig, startIndex, currentTime) };
-            });
-            if (fast === undefined)
+            if (!refreshConfig())
                 return { kind: "unavailable" };
-            if (fast.outcome === "cancelled")
+            if (!isRotationOperationCurrent(operation, config, usageDecisionEpoch))
                 return { kind: "cancelled" };
-            if (fast.value !== undefined && fast.value !== startIndex) {
+            for (const candidateIndex of listRotationCandidates(config, startIndex, currentTime)) {
+                if (!refreshConfig())
+                    return { kind: "unavailable" };
+                if (getQuotaBlockedUntil(config, candidateIndex, currentTime) !== undefined)
+                    continue;
+                const candidate = captureSelectionSnapshot(config, currentTime, candidateIndex);
+                if (!candidate)
+                    continue;
+                const usage = await fetchOpenCodeGoUsage(candidate, fetchApi, options.timers);
+                if (usageDecisionEpoch !== operation.epoch)
+                    return { kind: "cancelled" };
+                if (usage.ok && hasExhaustedWindow(usage)) {
+                    const blockedUntil = getExhaustedUntil(usage.usage, currentTime, getCooldownMs(config));
+                    const blocked = mutateSharedConfig((freshConfig) => {
+                        if (!isRotationOperationCurrent(operation, freshConfig, usageDecisionEpoch))
+                            return { outcome: "cancelled" };
+                        if (!matchesSelectionSnapshot(freshConfig, candidate, currentTime))
+                            return { outcome: "cancelled" };
+                        setQuotaBlock(freshConfig, candidate.keyIndex, blockedUntil, currentTime);
+                        return { outcome: "done", value: true };
+                    });
+                    if (blocked === undefined)
+                        return { kind: "unavailable" };
+                    if (blocked.outcome === "cancelled")
+                        return { kind: "cancelled" };
+                    continue;
+                }
+                const committed = mutateSharedConfig((freshConfig) => {
+                    if (!isRotationOperationCurrent(operation, freshConfig, usageDecisionEpoch))
+                        return { outcome: "cancelled" };
+                    if (!matchesSelectionSnapshot(freshConfig, candidate, currentTime))
+                        return { outcome: "cancelled" };
+                    applyRotationMode(mode, freshConfig, startIndex, currentTime);
+                    delete freshConfig.cooldowns[candidate.keyIndex];
+                    freshConfig.activeKeyIndex = candidate.keyIndex;
+                    return { outcome: "done", value: candidate.keyIndex };
+                });
+                if (committed === undefined)
+                    return { kind: "unavailable" };
+                if (committed.outcome === "cancelled")
+                    return { kind: "cancelled" };
                 const completion = currentRotationOperation(currentTime);
-                return completion ? { kind: "rotated", keyIndex: fast.value, completion } : { kind: "cancelled" };
+                return completion ? { kind: "rotated", keyIndex: committed.value, completion } : { kind: "cancelled" };
             }
-            // Snapshot the state this operation just produced, so a later commit can detect any
-            // external change to the same credential, block, cooldown or selection.
-            const retryOperation = currentRotationOperation(currentTime);
-            const failedKey = captureSelectionSnapshot(config, currentTime, startIndex);
-            if (!retryOperation || !failedKey)
-                return { kind: "cancelled" };
-            const recovered = await probeRecoveredHeadroom(currentTime, startIndex);
-            if (configError)
-                return { kind: "unavailable" };
-            if (usageDecisionEpoch !== operation.epoch)
-                return { kind: "cancelled" };
-            if (recovered.length === 0) {
-                // Still verify the state this operation owns: a shared writer may have moved the
-                // selection, credential, block or cooldown while the probes were in flight.
-                const current = matchesSelectionSnapshot(config, failedKey, currentTime)
-                    && isRotationOperationCurrent(retryOperation, config, usageDecisionEpoch);
-                return current ? { kind: "none", completion: retryOperation } : { kind: "cancelled" };
-            }
-            const commit = mutateSharedConfig((freshConfig) => {
-                if (!isRotationOperationCurrent(retryOperation, freshConfig, usageDecisionEpoch))
-                    return { outcome: "cancelled" };
-                if (!matchesSelectionSnapshot(freshConfig, failedKey, currentTime))
-                    return { outcome: "cancelled" };
-                if (!recovered.every((snapshot) => matchesSelectionSnapshot(freshConfig, snapshot, currentTime)))
-                    return { outcome: "cancelled" };
-                for (const snapshot of recovered) {
-                    delete freshConfig.quotaBlockedUntil[snapshot.keyIndex];
-                    delete freshConfig.cooldowns[snapshot.keyIndex];
-                }
-                return { outcome: "done", value: selectNextKey(mode, freshConfig, startIndex, currentTime) };
-            });
-            if (commit === undefined)
-                return { kind: "unavailable" };
-            if (commit.outcome === "cancelled")
-                return { kind: "cancelled" };
-            for (const snapshot of recovered) {
-                ctx.ui.notify(`OpenCode: ${snapshot.keyName} has headroom again → quota block cleared`, "info");
-            }
-            const completion = currentRotationOperation(currentTime);
-            if (!completion)
-                return { kind: "cancelled" };
-            const selected = commit.value;
-            return selected === undefined || selected === startIndex
-                ? { kind: "none", completion }
-                : { kind: "rotated", keyIndex: selected, completion };
-        }
-        /** Guarded startup/reload recovery: clears only blocks whose snapshot is still current. */
-        async function recoverQuotaBlocksGuarded(ctx, operation, currentTime) {
-            const recovered = await probeRecoveredHeadroom(currentTime);
-            if (configError)
-                return "unavailable";
-            if (usageDecisionEpoch !== operation.epoch)
-                return "cancelled";
-            if (recovered.length === 0) {
-                return isRotationOperationCurrent(operation, config, usageDecisionEpoch) ? "none" : "cancelled";
-            }
-            const commit = mutateSharedConfig((freshConfig) => {
+            const closed = mutateSharedConfig((freshConfig) => {
                 if (!isRotationOperationCurrent(operation, freshConfig, usageDecisionEpoch))
                     return { outcome: "cancelled" };
-                if (!recovered.every((snapshot) => matchesSelectionSnapshot(freshConfig, snapshot, currentTime)))
-                    return { outcome: "cancelled" };
-                for (const snapshot of recovered) {
-                    delete freshConfig.quotaBlockedUntil[snapshot.keyIndex];
-                    delete freshConfig.cooldowns[snapshot.keyIndex];
-                }
-                return { outcome: "done", value: true };
+                applyRotationMode(mode, freshConfig, startIndex, currentTime);
+                return { outcome: "done", value: undefined };
             });
-            if (commit === undefined)
-                return "unavailable";
-            if (commit.outcome === "cancelled")
-                return "cancelled";
-            for (const snapshot of recovered) {
-                ctx.ui.notify(`OpenCode: ${snapshot.keyName} has headroom again → quota block cleared`, "info");
-            }
-            return "recovered";
+            if (closed === undefined)
+                return { kind: "unavailable" };
+            if (closed.outcome === "cancelled")
+                return { kind: "cancelled" };
+            const completion = currentRotationOperation(currentTime);
+            return completion ? { kind: "none", completion } : { kind: "cancelled" };
         }
         function reportQuotaExhausted(ctx, exhaustedName, currentTime) {
             if (configError) {
@@ -1145,28 +1075,6 @@ export function createOpencodeGoRotationExtension(options = {}) {
             usageStatusCtx = ctx;
             if (!ensureConfig(ctx))
                 return;
-            // A block recorded in an earlier session can be stale: the plan was topped up, or the
-            // window reset before the deadline we stored. Re-check before it decides which key this
-            // session uses, rather than benching a key that is usable again -- or leaving every key
-            // held by a block with nothing left to rotate to.
-            if (config.keys.length > 0) {
-                const currentTime = now();
-                const activeBlocked = getQuotaBlockedUntil(config, config.activeKeyIndex, currentTime) !== undefined;
-                if (activeBlocked || pickAvailableKeyIndex(config, currentTime) === undefined) {
-                    const operation = currentRotationOperation(currentTime);
-                    if (!operation)
-                        return;
-                    const recovery = await recoverQuotaBlocksGuarded(ctx, operation, currentTime);
-                    // A startup continuation invalidated while probes were in flight must not
-                    // clear blocks or re-apply a key on top of the newer decision.
-                    if (recovery === "cancelled")
-                        return;
-                    if (usageDecisionEpoch !== operation.epoch)
-                        return;
-                    if (!refreshConfig())
-                        return;
-                }
-            }
             // On reload: re-apply active key, skip auto-import
             if (event.reason === "reload") {
                 applySynchronizedActiveKey(ctx);
@@ -1262,7 +1170,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 const operation = currentRotationOperation(currentTime);
                 if (!operation || operation.selection.keyIndex !== requestState.decision.target.keyIndex)
                     return;
-                const outcome = await rotateWithRecovery(ctx, operation, currentTime, {
+                const outcome = await rotateWithRecovery(operation, currentTime, {
                     kind: "quota",
                     blockedUntil,
                     authoritative: authoritativeReset !== undefined,
@@ -1299,7 +1207,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
             const operation = currentRotationOperation(currentTime);
             if (!operation || operation.selection.keyIndex !== requestState.decision.target.keyIndex)
                 return;
-            const outcome = await rotateWithRecovery(ctx, operation, currentTime, { kind: "cooldown" });
+            const outcome = await rotateWithRecovery(operation, currentTime, { kind: "cooldown" });
             if (outcome.kind === "cancelled")
                 return;
             if (outcome.kind === "unavailable") {
@@ -1351,10 +1259,10 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 return;
             const currentTime = now();
             const exhaustedName = config.keys[decision.target.keyIndex]?.name || `key-${decision.target.keyIndex + 1}`;
-            if (usage.ok && hasRateLimitedUsageWindow(usage)) {
-                const outcome = await rotateWithRecovery(ctx, operation, currentTime, {
+            if (usage.ok && hasExhaustedWindow(usage)) {
+                const outcome = await rotateWithRecovery(operation, currentTime, {
                     kind: "quota",
-                    blockedUntil: getRateLimitedUntil(usage.usage, currentTime, getCooldownMs(config)),
+                    blockedUntil: getExhaustedUntil(usage.usage, currentTime, getCooldownMs(config)),
                     authoritative: false,
                 });
                 if (outcome.kind === "cancelled")
@@ -1386,7 +1294,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 markHandledIfOwned();
                 return;
             }
-            const outcome = await rotateWithRecovery(ctx, operation, currentTime, { kind: "cooldown" });
+            const outcome = await rotateWithRecovery(operation, currentTime, { kind: "cooldown" });
             if (outcome.kind === "cancelled")
                 return;
             if (outcome.kind === "unavailable") {

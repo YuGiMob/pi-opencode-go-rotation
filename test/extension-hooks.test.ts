@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { AnthropicOptions, Context, Usage } from "@mariozechner/pi-ai";
 import { getModel, streamAnthropic } from "@mariozechner/pi-ai";
 import type { FetchApi, OpenCodeGoUsageWindow } from "../src/index.ts";
-import { updateConfig, type Config } from "../src/config-store.ts";
+import { updateConfig } from "../src/config-store.ts";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -179,7 +179,13 @@ const activeUsage = (name = "weekly") => usageResponse([{ name, status: "active"
 function usageResponse(windows: OpenCodeGoUsageWindow[]): Awaited<ReturnType<FetchApi>> {
 	return { ok: true, status: 200, json: async () => ({ windows }) };
 }
-
+function usagePerKey(byKey: Record<string, Awaited<ReturnType<FetchApi>>>): FetchApi {
+	const fallback = activeUsage();
+	return async (_url, init) => {
+		const token = (init.headers.Authorization ?? "").replace(/^Bearer\s+/, "");
+		return byKey[token] ?? fallback;
+	};
+}
 
 let tempConfigQueue = Promise.resolve();
 
@@ -497,10 +503,8 @@ test("fixed-window quota errors fall back to the cooldown when no reset is parse
 
 test("response quota rotation and message_end cannot rotate twice", async () => {
 	await withTempConfig(async (configPath) => {
-		const fetch: FetchApi = async () => ({
-			ok: true,
-			status: 200,
-			json: async () => ({ windows: [{ name: "weekly", status: "rate-limited", resetInSec: 3_600 }] }),
+		const fetch = usagePerKey({
+			"sk-one": usageResponse([{ name: "weekly", status: "rate-limited", resetInSec: 3_600 }]),
 		});
 		const { pi, ctx, state } = createHarness("authStorage", fetch);
 
@@ -563,10 +567,8 @@ test("a fixed-window message upgrades a transient response rotation without rota
 
 test("an authoritative message reset replaces a longer usage fallback", async () => {
 	await withTempConfig(async (configPath) => {
-		const fetch: FetchApi = async () => ({
-			ok: true,
-			status: 200,
-			json: async () => ({ windows: [{ name: "weekly", status: "rate-limited" }] }),
+		const fetch = usagePerKey({
+			"sk-one": usageResponse([{ name: "weekly", status: "rate-limited" }]),
 		});
 		const { pi, ctx } = createHarness("authStorage", fetch);
 
@@ -604,21 +606,16 @@ test("an unmatched 429 response cannot rotate after another provider request sta
 	});
 });
 
-test("sequential quota failures try each key once and then stop", async () => {
+test("one quota failure blocks every exhausted candidate and then stops", async () => {
 	await withTempConfig(async (configPath) => {
-		const fetch: FetchApi = async () => ({
-			ok: true,
-			status: 200,
-			json: async () => ({ windows: [{ name: "weekly", status: "rate-limited", resetInSec: 3_600 }] }),
+		const fetch = usagePerKey({
+			"sk-two": usageResponse([{ name: "weekly", status: "rate-limited", resetInSec: 3_600 }]),
+			"sk-three": usageResponse([{ name: "weekly", status: "rate-limited", resetInSec: 7_200 }]),
 		});
 		const { pi, ctx, state } = createHarness("authStorage", fetch);
 
 		await pi.emit("session_start", { reason: "start" }, ctx);
-		for (const expectedKey of ["sk-two", "sk-three", "sk-three"]) {
-			await pi.emit("before_provider_request", {}, ctx);
-			await pi.emit("after_provider_response", { status: 429 }, ctx);
-			assert.equal(state.runtimeKeys.at(-1), expectedKey);
-		}
+		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("message_end", {
 			message: {
 				role: "assistant",
@@ -628,10 +625,11 @@ test("sequential quota failures try each key once and then stop", async () => {
 			},
 		}, ctx);
 
+		assert.equal(state.runtimeKeys.at(-1), "sk-one");
 		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, {
-			"0": 3_600_000,
+			"0": Date.parse("2026-08-01T12:00:00Z"),
 			"1": 3_600_000,
-			"2": Date.parse("2026-08-01T12:00:00Z"),
+			"2": 7_200_000,
 		});
 		assert.match(state.notifications.join("\n"), /all configured keys.*quota-blocked/i);
 		assert.equal(state.notifications.filter((message) => /all configured keys.*quota-blocked/i.test(message)).length, 1);
@@ -666,10 +664,8 @@ test("quota exhaustion falls back to a cooling key instead of keeping the blocke
 			...persisted,
 			cooldowns: { 1: 0, 2: 0 },
 		}), { mode: 0o600 });
-		const fetch: FetchApi = async () => ({
-			ok: true,
-			status: 200,
-			json: async () => ({ windows: [{ name: "weekly", status: "rate-limited", resetInSec: 3_600 }] }),
+		const fetch = usagePerKey({
+			"sk-one": usageResponse([{ name: "weekly", status: "rate-limited", resetInSec: 3_600 }]),
 		});
 		const { pi, ctx, state } = createHarness("authStorage", fetch);
 
@@ -870,17 +866,11 @@ test("unknown command help lists the quota alias", async () => {
 
 test("http 429 rotates and persists the latest authoritative usage reset", async () => {
 	await withTempConfig(async (configPath) => {
-		const fetch: FetchApi = async () => ({
-			ok: true,
-			status: 200,
-			json: async () => ({
-				plan: "lite",
-				useBalance: false,
-				windows: [
-					{ name: "5-hour", status: "rate-limited", usagePercent: 100, resetInSec: 3_600 },
-					{ name: "weekly", status: "rate-limited", usagePercent: 100, resetInSec: 86_400, used: 30, limit: 30 },
-				],
-			}),
+		const fetch = usagePerKey({
+			"sk-one": usageResponse([
+				{ name: "5-hour", status: "rate-limited", usagePercent: 100, resetInSec: 3_600 },
+				{ name: "weekly", status: "rate-limited", usagePercent: 100, resetInSec: 86_400, used: 30, limit: 30 },
+			]),
 		});
 		const { pi, ctx, state } = createHarness("authStorage", fetch);
 
@@ -897,9 +887,8 @@ test("http 429 rotates and persists the latest authoritative usage reset", async
 test("http 401 verifies monthly quota and rotates once before retry", async () => {
 	await withTempConfig(async (configPath) => {
 		const reset = "2026-09-01T00:00:00Z";
-		const fetch: FetchApi = async () => ({
-			ok: true, status: 200,
-			json: async () => ({ usage: { monthly: { status: "rate-limited", percent: 100, resetsAt: reset } } }),
+		const fetch = usagePerKey({
+			"sk-one": { ok: true, status: 200, json: async () => ({ usage: { monthly: { status: "rate-limited", percent: 100, resetsAt: reset } } }) },
 		});
 		const { pi, ctx, state } = createHarness("runtime", fetch);
 		await pi.emit("session_start", { reason: "start" }, ctx);
@@ -918,9 +907,8 @@ test("http 401 verifies monthly quota and rotates once before retry", async () =
 
 test("http 401 quota rotation survives a stalled response body without rotating again", async () => {
 	await withTempConfig(async (configPath) => {
-		const { pi, ctx, state, clock, timers } = createHarness("runtime", async () => ({
-			ok: true, status: 200,
-			json: async () => ({ usage: { monthly: { status: "rate-limited", percent: 100, resetsAt: "2026-09-01T00:00:00Z" } } }),
+		const { pi, ctx, state, clock, timers } = createHarness("runtime", usagePerKey({
+			"sk-one": { ok: true, status: 200, json: async () => ({ usage: { monthly: { status: "rate-limited", percent: 100, resetsAt: "2026-09-01T00:00:00Z" } } }) },
 		}));
 		await pi.emit("session_start", { reason: "start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
@@ -1384,232 +1372,132 @@ test("real Anthropic serialization omits an assistant turn emptied by the projec
 	});
 });
 
-// ---------------------------------------------------------------------------
-// Guarded quota recovery and late-continuation invalidation
-// ---------------------------------------------------------------------------
-
-const twoKeys = [{ name: "one", key: "sk-one" }, { name: "two", key: "sk-two" }];
-const fixedWindowError = "You have exceeded the 5-hour usage quota.";
 const transientError = "429 Too Many Requests";
 const assistantError = (errorMessage: string) => ({
 	message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage },
 });
 
-test("recovery clears a blocked key with confirmed headroom and rotates to it", async () => {
+test("rotation skips a candidate at 100% and blocks it until its reset", async () => {
 	await withTempConfig(async (configPath) => {
-		patchConfig(configPath, { keys: twoKeys, quotaBlockedUntil: { 1: 9_999_999 } });
-		const { pi, ctx, state } = createHarness("authStorage", async () => activeUsage());
+		const fetch = usagePerKey({
+			"sk-two": usageResponse([{ name: "weekly", status: "rate-limited", resetInSec: 3_600 }]),
+		});
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
 
 		await pi.emit("session_start", { reason: "start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("message_end", assistantError(transientError), ctx);
 
-		assert.equal(state.runtimeKeys.at(-1), "sk-two");
-		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, {});
-		assert.match(state.notifications.join("\n"), /two has headroom again/);
+		assert.equal(state.runtimeKeys.at(-1), "sk-three");
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, { "1": 3_600_000 });
 	});
 });
 
-test("quota recovery probes every blocked key at the same time", async () => {
+test("an active window at 100% blocks a candidate until its reset date", async () => {
 	await withTempConfig(async (configPath) => {
-		patchConfig(configPath, { quotaBlockedUntil: { 1: 9_999_999, 2: 9_999_999 } });
-		const pending: Array<(response: Awaited<ReturnType<FetchApi>>) => void> = [];
+		const reset = "2026-12-01T00:00:00Z";
+		const fetch = usagePerKey({
+			"sk-two": usageResponse([{ name: "monthly", status: "active", usagePercent: 100, resetAt: reset }]),
+		});
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("message_end", assistantError(transientError), ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-three");
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, { "1": Date.parse(reset) });
+	});
+});
+
+test("active windows at their used limit or with nothing remaining block candidates", async () => {
+	await withTempConfig(async (configPath) => {
+		const fetch = usagePerKey({
+			"sk-two": usageResponse([{ name: "monthly", status: "active", used: 30, limit: 30, resetInSec: 86_400 }]),
+			"sk-three": usageResponse([{ name: "weekly", status: "active", remaining: 0, resetInSec: 3_600 }]),
+		});
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("message_end", assistantError(transientError), ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-one");
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, { "1": 86_400_000, "2": 3_600_000 });
+	});
+});
+
+test("a quota-blocked candidate is not fetched before its reset", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { quotaBlockedUntil: { 1: 9_999_999 } });
 		const authorizations: string[] = [];
 		const fetch: FetchApi = async (_url, init) => {
 			authorizations.push(init.headers.Authorization ?? "");
-			return await new Promise<Awaited<ReturnType<FetchApi>>>((resolve) => {
-				pending.push(resolve);
-			});
+			return usageResponse([{ name: "weekly", status: "active" }]);
 		};
 		const { pi, ctx, state } = createHarness("authStorage", fetch);
 
 		await pi.emit("session_start", { reason: "start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
-		const event = pi.emit("message_end", assistantError(transientError), ctx);
+		await pi.emit("message_end", assistantError(transientError), ctx);
 
-		assert.equal(pending.length, 2, "both blocked keys must be probed before either response arrives");
-
-		for (const resolve of pending) resolve(activeUsage());
-		await event;
-
-		assert.deepEqual(authorizations, ["Bearer sk-two", "Bearer sk-three"]);
-		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, {});
-		assert.equal(state.runtimeKeys.at(-1), "sk-two");
-		assert.match(state.notifications.join("\n"), /two has headroom again/);
-		assert.match(state.notifications.join("\n"), /three has headroom again/);
+		assert.deepEqual(authorizations, ["Bearer sk-three"]);
+		assert.equal(state.runtimeKeys.at(-1), "sk-three");
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["1"], 9_999_999);
 	});
 });
 
-test("late transient recovery cannot override a manual key selection", async () => {
+test("a manual selection cancels a pending candidate check", async () => {
 	await withTempConfig(async (configPath) => {
-		patchConfig(configPath, { keys: twoKeys, quotaBlockedUntil: { 1: 9_999_999 } });
-		const usage = deferred<Awaited<ReturnType<FetchApi>>>();
-		const { pi, ctx, state } = createHarness("authStorage", async () => usage.promise);
+		const candidate = deferred<Awaited<ReturnType<FetchApi>>>();
+		const { pi, ctx, state } = createHarness("authStorage", async () => candidate.promise);
 
 		await pi.emit("session_start", { reason: "start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		const pending = pi.emit("message_end", assistantError(transientError), ctx);
-		await pi.runCommand("opencode", "use 1", ctx);
-		usage.resolve(activeUsage());
+		await pi.runCommand("opencode", "use 2", ctx);
+		candidate.resolve(usageResponse([{ name: "weekly", status: "active" }]));
 		await pending;
 
-		assert.equal(readConfig(configPath).activeKeyIndex, 0);
-		assert.deepEqual(state.runtimeKeys, ["sk-one"]);
+		assert.deepEqual(state.runtimeKeys, ["sk-one", "sk-two"]);
+		assert.equal(readConfig(configPath).activeKeyIndex, 1);
+		assert.equal(state.notifications.some((message) => /rotated to/.test(message)), false);
 	});
 });
 
-test("late after-response recovery cannot override a manual key selection", async () => {
+test("a late exhausted-candidate result cannot block a manually selected key", async () => {
 	await withTempConfig(async (configPath) => {
-		patchConfig(configPath, { keys: twoKeys, quotaBlockedUntil: { 1: 9_999_999 } });
-		const recovery = deferred<Awaited<ReturnType<FetchApi>>>();
-		let probeStarted: () => void = () => {};
-		const started = new Promise<void>((resolve) => { probeStarted = resolve; });
-		let calls = 0;
-		const { pi, ctx, state } = createHarness("authStorage", async () => {
-			calls++;
-			if (calls === 1) return activeUsage();
-			probeStarted();
-			return await recovery.promise;
-		});
+		const candidate = deferred<Awaited<ReturnType<FetchApi>>>();
+		const { pi, ctx, state } = createHarness("authStorage", async () => candidate.promise);
 
 		await pi.emit("session_start", { reason: "start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
-		const pending = pi.emit("after_provider_response", { status: 429 }, ctx);
-		await started;
-		await pi.runCommand("opencode", "use 1", ctx);
-		recovery.resolve(activeUsage());
+		const pending = pi.emit("message_end", assistantError(transientError), ctx);
+		await pi.runCommand("opencode", "use 2", ctx);
+		candidate.resolve(usageResponse([{ name: "weekly", status: "rate-limited", resetInSec: 3_600 }]));
 		await pending;
 
-		assert.equal(readConfig(configPath).activeKeyIndex, 0);
-		assert.deepEqual(state.runtimeKeys, ["sk-one"]);
-	});
-});
-
-test("late recovery cannot quota-block a replacement for a removed failed key", async () => {
-	await withTempConfig(async (configPath) => {
-		patchConfig(configPath, { keys: twoKeys, activeKeyIndex: 1, quotaBlockedUntil: { 0: 9_999_999 } });
-		const usage = deferred<Awaited<ReturnType<FetchApi>>>();
-		const { pi, ctx } = createHarness("authStorage", async () => usage.promise);
-
-		await pi.emit("session_start", { reason: "start" }, ctx);
-		await pi.emit("before_provider_request", {}, ctx);
-		const pending = pi.emit("message_end", assistantError(fixedWindowError), ctx);
-		await pi.runCommand("opencode", "rm 2", ctx);
-		await pi.runCommand("opencode", "add replacement synthetic-replacement", ctx);
-		usage.resolve(activeUsage());
-		await pending;
-
-		const config = readConfig(configPath);
-		assert.equal(config.keys[1].key, "synthetic-replacement");
-		assert.equal(config.quotaBlockedUntil?.["1"], undefined);
-	});
-});
-
-test("stale after-response bookkeeping cannot suppress the next request rotation", async () => {
-	await withTempConfig(async (configPath) => {
-		patchConfig(configPath, { keys: twoKeys, quotaBlockedUntil: { 1: 9_999_999 } });
-		const recovery = deferred<Awaited<ReturnType<FetchApi>>>();
-		let probeStarted: () => void = () => {};
-		const started = new Promise<void>((resolve) => { probeStarted = resolve; });
-		let calls = 0;
-		const { pi, ctx, state } = createHarness("authStorage", async () => {
-			calls++;
-			if (calls === 1) return activeUsage();
-			probeStarted();
-			return await recovery.promise;
-		});
-
-		await pi.emit("session_start", { reason: "start" }, ctx);
-		await pi.emit("before_provider_request", {}, ctx);
-		const pending = pi.emit("after_provider_response", { status: 429 }, ctx);
-		await started;
-		await pi.emit("before_provider_request", {}, ctx);
-		recovery.resolve(activeUsage());
-		await pending;
-
-		assert.equal(state.runtimeKeys.at(-1), "sk-one", "a superseded response must not rotate or mark itself handled");
-		await pi.emit("message_end", assistantError(transientError), ctx);
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, {});
+		assert.equal(readConfig(configPath).activeKeyIndex, 1);
 		assert.equal(state.runtimeKeys.at(-1), "sk-two");
-		assert.match(state.notifications.join("\n"), /Rate-limited → rotated to two/);
 	});
 });
 
-test("a stale startup recovery cannot override a manual key selection", async () => {
+test("footer usage refresh blocks the active key and the next request rotates", async () => {
 	await withTempConfig(async (configPath) => {
-		patchConfig(configPath, { quotaBlockedUntil: { 0: 9_999_999 } });
-		const usage = deferred<Awaited<ReturnType<FetchApi>>>();
-		const { pi, ctx } = createHarness("authStorage", async () => usage.promise);
-
-		const startup = pi.emit("session_start", { reason: "start" }, ctx);
-		await pi.runCommand("opencode", "use 3", ctx);
-		usage.resolve(activeUsage());
-		await startup;
-
-		assert.equal(readConfig(configPath).activeKeyIndex, 2);
-		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], 9_999_999);
-	});
-});
-
-const snapshotMutations = [
-	{ name: "quota deadline", mutate: (config: Config) => { config.quotaBlockedUntil[0] = 19_999_999; } },
-	{ name: "cooldown", mutate: (config: Config) => { config.cooldowns[0] = 500_000; } },
-	{ name: "active selection", mutate: (config: Config) => { config.activeKeyIndex = 1; } },
-	{ name: "credential", mutate: (config: Config) => { config.keys[0].key = "sk-replaced"; } },
-] satisfies Array<{ name: string; mutate: (config: Config) => void }>;
-
-for (const { name, mutate } of snapshotMutations) {
-	test(`a changed shared ${name} cancels pending startup recovery`, async () => {
-		await withTempConfig(async (configPath) => {
-			patchConfig(configPath, { quotaBlockedUntil: { 0: 9_999_999 } });
-			const usage = deferred<Awaited<ReturnType<FetchApi>>>();
-			const { pi, ctx } = createHarness("authStorage", async () => usage.promise);
-
-			const startup = pi.emit("session_start", { reason: "start" }, ctx);
-			updateConfig((config) => mutate(config));
-			const afterMutation = readConfig(configPath);
-			usage.resolve(activeUsage());
-			await startup;
-
-			assert.deepEqual(readConfig(configPath), afterMutation);
+		const reset = "2026-11-12T00:00:00Z";
+		const fetch = usagePerKey({
+			"sk-one": usageResponse([{ name: "monthly", status: "active", usagePercent: 100, resetAt: reset }]),
 		});
-	});
-}
+		const { pi, ctx, state } = createHarness("authStorage", fetch, true);
 
-for (const { name, response, cleared } of [
-	{ name: "an empty window list", response: usageResponse([]), cleared: false },
-	{ name: "mixed active and unknown windows", response: usageResponse([{ name: "rolling", status: "active" }, { name: "monthly", status: "unknown" }]), cleared: false },
-	{ name: "a rate-limited window", response: usageResponse([{ status: "rate-limited" }]), cleared: false },
-	{ name: "a malformed usage body", response: { ok: true, status: 200, json: async () => ({ windows: [42] }) }, cleared: false },
-	{ name: "a failed usage request", response: { ok: false, status: 503, json: async () => ({}) }, cleared: false },
-	{ name: "all windows active", response: usageResponse([{ name: "rolling", status: "active" }, { name: "weekly", status: "active" }]), cleared: true },
-]) {
-	test(`startup recovery treats ${name} as ${cleared ? "confirmed headroom" : "uncertain"}`, async () => {
-		await withTempConfig(async (configPath) => {
-			patchConfig(configPath, { quotaBlockedUntil: { 0: 9_999_999 } });
-			const { pi, ctx, state } = createHarness("authStorage", async () => response);
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], Date.parse(reset));
 
-			await pi.emit("session_start", { reason: "start" }, ctx);
-
-			assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], cleared ? undefined : 9_999_999);
-			// Recovery never replaces the startup fallback: an uncertain reading leaves the
-			// healthy key active rather than leaving the session with no key.
-			assert.equal(state.runtimeKeys.at(-1), cleared ? "sk-one" : "sk-two");
-		});
-	});
-}
-
-test("a late headroom snapshot cannot erase a newer shared-session quota block", async () => {
-	await withTempConfig(async (configPath) => {
-		patchConfig(configPath, { quotaBlockedUntil: { 0: 9_999_999 } });
-		const usage = deferred<Awaited<ReturnType<FetchApi>>>();
-		const { pi, ctx } = createHarness("authStorage", async () => usage.promise);
-
-		const startup = pi.emit("session_start", { reason: "start" }, ctx);
-		updateConfig((config) => { config.quotaBlockedUntil[0] = 19_999_999; });
-		usage.resolve(activeUsage());
-		await startup;
-
-		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], 19_999_999);
+		await pi.emit("before_provider_request", {}, ctx);
+		assert.equal(readConfig(configPath).activeKeyIndex, 1);
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
 	});
 });
 
@@ -1641,23 +1529,6 @@ test("a fast-path message_end rotation cannot notify after a newer request start
 		await pending;
 
 		assert.doesNotMatch(state.notifications.join("\n"), /rotated to two/, "a superseded message_end must not report its old rotation");
-	});
-});
-
-test("a stale uncertain recovery cannot report exhaustion for a superseded decision", async () => {
-	await withTempConfig(async (configPath) => {
-		patchConfig(configPath, { keys: twoKeys, quotaBlockedUntil: { 1: 9_999_999 } });
-		const usage = deferred<Awaited<ReturnType<FetchApi>>>();
-		const { pi, ctx, state } = createHarness("authStorage", async () => usage.promise);
-
-		await pi.emit("session_start", { reason: "start" }, ctx);
-		await pi.emit("before_provider_request", {}, ctx);
-		const pending = pi.emit("message_end", assistantError(transientError), ctx);
-		await pi.runCommand("opencode", "use 1", ctx);
-		usage.resolve(usageResponse([]));
-		await pending;
-
-		assert.doesNotMatch(state.notifications.join("\n"), /all other keys are quota-blocked/);
 	});
 });
 
