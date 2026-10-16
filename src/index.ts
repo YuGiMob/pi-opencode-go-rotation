@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import {
 	ConfigLoadError,
 	DEFAULT_COOLDOWN_MINUTES,
@@ -8,6 +8,11 @@ import {
 	updateConfig,
 	type Config,
 } from "./config-store.ts";
+
+import { openOpencodeConfig, removeKey } from "./config-ui.ts";
+import { formatDuration, formatResetIn } from "./format-time.ts";
+
+export { formatResetIn };
 
 const PROVIDER = "opencode-go";
 const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
@@ -300,6 +305,11 @@ interface RuntimeKeyStore {
 	removeRuntimeApiKey(provider: string): void | Promise<void>;
 }
 
+interface RuntimeKeyStoreHost {
+	authStorage?: RuntimeKeyStore;
+	runtime?: RuntimeKeyStore;
+}
+
 // Key equality detects credential changes, but persisted history has no issuer
 // provenance (including after reload). Never replay signed reasoning on this
 // rotating route, even before this process observes its first rotation.
@@ -386,8 +396,9 @@ function sanitizeReasoningPayload(payload: unknown): unknown {
 
 const lastAppliedRuntimeKeys = new WeakMap<object, string>();
 
-function getRuntimeKeyStore(modelRegistry: { authStorage?: RuntimeKeyStore; runtime?: RuntimeKeyStore }): RuntimeKeyStore {
-	const store = modelRegistry.authStorage ?? modelRegistry.runtime;
+function getRuntimeKeyStore(modelRegistry: ModelRegistry): RuntimeKeyStore {
+	const host = modelRegistry as unknown as RuntimeKeyStoreHost;
+	const store = host.authStorage ?? host.runtime;
 	if (!store) throw new Error("Model registry does not expose runtime API key storage");
 	return store;
 }
@@ -397,7 +408,7 @@ function ignoreAsyncRefresh(result: void | Promise<void>): void {
 }
 
 /** Set the active key as runtime override (highest priority in auth chain). */
-function applyActiveKey(config: Config, modelRegistry: { authStorage?: RuntimeKeyStore; runtime?: RuntimeKeyStore }, now = Date.now()): string | undefined {
+function applyActiveKey(config: Config, modelRegistry: ModelRegistry, now = Date.now()): string | undefined {
 	const idx = pickAvailableKeyIndex(config, now);
 	if (idx === undefined) return undefined;
 	if (config.activeKeyIndex !== idx) config.activeKeyIndex = idx;
@@ -693,28 +704,8 @@ function blockQuotaAndSelectNext(config: Config, keyIndex: number, blockedUntil:
 	return next;
 }
 
-function reindexAfterRemoval(record: Record<number, number>, removedIndex: number): Record<number, number> {
-	const shifted: Record<number, number> = {};
-	for (const [key, value] of Object.entries(record)) {
-		const index = Number(key);
-		if (index === removedIndex) continue;
-		shifted[index > removedIndex ? index - 1 : index] = value;
-	}
-	return shifted;
-}
-
 function formatUsageAmount(value: number | undefined): string | undefined {
 	return value === undefined ? undefined : value.toLocaleString("en-US");
-}
-
-export function formatResetIn(seconds: number): string {
-	if (seconds <= 0) return "now";
-	const days = Math.floor(seconds / 86_400);
-	const hours = Math.floor((seconds % 86_400) / 3_600);
-	const minutes = Math.ceil((seconds % 3_600) / 60);
-	if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
-	if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
-	return minutes > 0 ? `${minutes}m` : "less than 1m";
 }
 
 function formatUsageWindow(window: OpenCodeGoUsageWindow, index: number): string {
@@ -825,14 +816,6 @@ interface WatchdogEvent {
 	elapsedMs: number;
 	idleForMs: number;
 	lastStatus?: number;
-}
-
-function formatDuration(ms: number): string {
-	const seconds = Math.max(0, Math.ceil(ms / 1000));
-	if (seconds < 60) return `${seconds}s`;
-	const minutes = Math.floor(seconds / 60);
-	const remainder = seconds % 60;
-	return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
 }
 
 function formatTimeoutInfo(info: ProviderTimeoutInfo): string {
@@ -1556,10 +1539,28 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			handler: async (args, ctx) => {
 				if (!ensureConfig(ctx)) return;
 				const parts = args.trim().split(/\s+/);
-				const subcommand = parts[0] || "status";
+				const subcommand = parts[0] || "";
 				const indexArg = parseInt(parts[1] ?? "", 10);
 
 				switch (subcommand) {
+					case "":
+					case "config":
+					case "ui": {
+						if (ctx.mode !== "tui") {
+							ctx.ui.notify(formatStatus(config, now()), "info");
+							break;
+						}
+						const result = await openOpencodeConfig(ctx);
+						if (!ensureConfig(ctx)) return;
+						if (result.usageKeyIndex !== undefined) {
+							const target = getUsageTargetForKeyIndex(config, result.usageKeyIndex);
+							const usage = await fetchOpenCodeGoUsage(target, fetchApi, options.timers);
+							ctx.ui.notify(formatUsageStatus(usage), usage.ok ? "info" : "warning");
+						}
+						applySynchronizedActiveKey(ctx);
+						syncUsageStatus(ctx, true);
+						break;
+					}
 					case "status":
 					case "list":
 					case "ls": {
@@ -1662,11 +1663,8 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 							if (isNaN(removeIndex) || removeIndex < 0 || removeIndex >= freshConfig.keys.length) {
 								return { error: `Invalid index. Use 1-${freshConfig.keys.length}.` };
 							}
-							const removed = freshConfig.keys.splice(removeIndex, 1)[0];
-							freshConfig.cooldowns = reindexAfterRemoval(freshConfig.cooldowns, removeIndex);
-							freshConfig.quotaBlockedUntil = reindexAfterRemoval(freshConfig.quotaBlockedUntil, removeIndex);
-							if (freshConfig.activeKeyIndex >= freshConfig.keys.length) freshConfig.activeKeyIndex = 0;
-							else if (removeIndex < freshConfig.activeKeyIndex) freshConfig.activeKeyIndex--;
+							const removed = freshConfig.keys[removeIndex];
+							removeKey(freshConfig, removeIndex);
 							return { removedName: removed.name, count: freshConfig.keys.length };
 						});
 						if (!result) {
@@ -1765,7 +1763,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 
 					default:
 						ctx.ui.notify(
-							"Usage: /opencode [status|usage|quota|events|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|watchdog [status|on|off|<seconds>]]",
+							"Usage: /opencode [config|status|usage|quota|events|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|watchdog [status|on|off|<seconds>]]",
 							"info",
 						);
 				}

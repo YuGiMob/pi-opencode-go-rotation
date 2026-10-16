@@ -22,6 +22,20 @@ Add your API keys:
 
 The first key added becomes active immediately.
 
+## Interactive key manager
+
+In interactive mode, `/opencode` (or `/opencode config`) opens the key manager overlay. It lists every key with its active, cooldown, or quota-blocked state, and lets you:
+
+- Activate a key and clear its cooldown and quota block
+- Rename a key or replace its secret
+- Remove a key
+- Add a key without remembering the command syntax
+- Check a key's usage after the window closes
+- Change the cooldown duration and the watchdog settings
+- Clear every cooldown and quota block
+
+Changes are saved as soon as they are confirmed. Outside interactive mode the command prints the text status instead.
+
 ## How it works
 
 The extension sets the active key as a runtime override, which takes priority over `OPENCODE_API_KEY` environment variables and `auth.json` credentials.
@@ -56,7 +70,8 @@ It refreshes on session start, model changes, turns, key rotations, manual key c
 
 | Command | Description |
 |---------|-------------|
-| `/opencode` or `/opencode status` | Show all keys, active key marker, cooldown and quota-blocked status |
+| `/opencode` or `/opencode config` | Open the interactive key manager |
+| `/opencode status` | Show all keys, active key marker, cooldown and quota-blocked status |
 | `/opencode usage` or `/opencode quota` | Fetch OpenCode Go usage for the active key without showing key material |
 | `/opencode use <n>` | Switch to key number `n` (1-based) and clear its cooldown and quota block |
 | `/opencode next` | Advance to the next configured key and clear its cooldown and quota block before activating it |

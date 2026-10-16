@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AnthropicOptions, Context, Usage } from "@mariozechner/pi-ai";
 import { getModel, streamAnthropic } from "@mariozechner/pi-ai";
 import type { FetchApi, OpenCodeGoUsageWindow } from "../src/index.ts";
@@ -1642,5 +1642,16 @@ test("a stale uncertain recovery cannot report exhaustion for a superseded decis
 		await pending;
 
 		assert.doesNotMatch(state.notifications.join("\n"), /all other keys are quota-blocked/);
+	});
+});
+
+test("/opencode without a subcommand falls back to status outside TUI mode", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx, state } = createHarness();
+
+		await pi.runCommand("opencode", "", ctx);
+
+		assert.match(state.notifications.at(-1) ?? "", /one/);
+		assert.match(state.notifications.at(-1) ?? "", /Watchdog:/);
 	});
 });

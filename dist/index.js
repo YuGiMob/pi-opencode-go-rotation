@@ -1,4 +1,7 @@
 import { ConfigLoadError, DEFAULT_COOLDOWN_MINUTES, DEFAULT_WATCHDOG_IDLE_MS, createEmptyConfig, loadConfig, updateConfig, } from "./config-store.js";
+import { openOpencodeConfig, removeKey } from "./config-ui.js";
+import { formatDuration, formatResetIn } from "./format-time.js";
+export { formatResetIn };
 const PROVIDER = "opencode-go";
 const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 const OPENCODE_GO_USAGE_TIMEOUT_MS = 10_000;
@@ -263,7 +266,8 @@ function sanitizeReasoningPayload(payload) {
 }
 const lastAppliedRuntimeKeys = new WeakMap();
 function getRuntimeKeyStore(modelRegistry) {
-    const store = modelRegistry.authStorage ?? modelRegistry.runtime;
+    const host = modelRegistry;
+    const store = host.authStorage ?? host.runtime;
     if (!store)
         throw new Error("Model registry does not expose runtime API key storage");
     return store;
@@ -540,30 +544,8 @@ function blockQuotaAndSelectNext(config, keyIndex, blockedUntil, now, isAuthorit
         config.activeKeyIndex = next;
     return next;
 }
-function reindexAfterRemoval(record, removedIndex) {
-    const shifted = {};
-    for (const [key, value] of Object.entries(record)) {
-        const index = Number(key);
-        if (index === removedIndex)
-            continue;
-        shifted[index > removedIndex ? index - 1 : index] = value;
-    }
-    return shifted;
-}
 function formatUsageAmount(value) {
     return value === undefined ? undefined : value.toLocaleString("en-US");
-}
-export function formatResetIn(seconds) {
-    if (seconds <= 0)
-        return "now";
-    const days = Math.floor(seconds / 86_400);
-    const hours = Math.floor((seconds % 86_400) / 3_600);
-    const minutes = Math.ceil((seconds % 3_600) / 60);
-    if (days > 0)
-        return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
-    if (hours > 0)
-        return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
-    return minutes > 0 ? `${minutes}m` : "less than 1m";
 }
 function formatUsageWindow(window, index) {
     const label = window.name ?? `window ${index + 1}`;
@@ -669,14 +651,6 @@ function formatStatus(config, now = Date.now()) {
         }
         return `${marker} ${i + 1}. ${key.name}${tag}`;
     }).join("\n")}\n${watchdogStatus}`;
-}
-function formatDuration(ms) {
-    const seconds = Math.max(0, Math.ceil(ms / 1000));
-    if (seconds < 60)
-        return `${seconds}s`;
-    const minutes = Math.floor(seconds / 60);
-    const remainder = seconds % 60;
-    return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
 }
 function formatTimeoutInfo(info) {
     const status = info.lastStatus === undefined ? "" : `, last HTTP ${info.lastStatus}`;
@@ -1438,9 +1412,28 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 if (!ensureConfig(ctx))
                     return;
                 const parts = args.trim().split(/\s+/);
-                const subcommand = parts[0] || "status";
+                const subcommand = parts[0] || "";
                 const indexArg = parseInt(parts[1] ?? "", 10);
                 switch (subcommand) {
+                    case "":
+                    case "config":
+                    case "ui": {
+                        if (ctx.mode !== "tui") {
+                            ctx.ui.notify(formatStatus(config, now()), "info");
+                            break;
+                        }
+                        const result = await openOpencodeConfig(ctx);
+                        if (!ensureConfig(ctx))
+                            return;
+                        if (result.usageKeyIndex !== undefined) {
+                            const target = getUsageTargetForKeyIndex(config, result.usageKeyIndex);
+                            const usage = await fetchOpenCodeGoUsage(target, fetchApi, options.timers);
+                            ctx.ui.notify(formatUsageStatus(usage), usage.ok ? "info" : "warning");
+                        }
+                        applySynchronizedActiveKey(ctx);
+                        syncUsageStatus(ctx, true);
+                        break;
+                    }
                     case "status":
                     case "list":
                     case "ls": {
@@ -1543,13 +1536,8 @@ export function createOpencodeGoRotationExtension(options = {}) {
                             if (isNaN(removeIndex) || removeIndex < 0 || removeIndex >= freshConfig.keys.length) {
                                 return { error: `Invalid index. Use 1-${freshConfig.keys.length}.` };
                             }
-                            const removed = freshConfig.keys.splice(removeIndex, 1)[0];
-                            freshConfig.cooldowns = reindexAfterRemoval(freshConfig.cooldowns, removeIndex);
-                            freshConfig.quotaBlockedUntil = reindexAfterRemoval(freshConfig.quotaBlockedUntil, removeIndex);
-                            if (freshConfig.activeKeyIndex >= freshConfig.keys.length)
-                                freshConfig.activeKeyIndex = 0;
-                            else if (removeIndex < freshConfig.activeKeyIndex)
-                                freshConfig.activeKeyIndex--;
+                            const removed = freshConfig.keys[removeIndex];
+                            removeKey(freshConfig, removeIndex);
                             return { removedName: removed.name, count: freshConfig.keys.length };
                         });
                         if (!result) {
@@ -1649,7 +1637,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
                         break;
                     }
                     default:
-                        ctx.ui.notify("Usage: /opencode [status|usage|quota|events|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|watchdog [status|on|off|<seconds>]]", "info");
+                        ctx.ui.notify("Usage: /opencode [config|status|usage|quota|events|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|watchdog [status|on|off|<seconds>]]", "info");
                 }
             },
         });

@@ -27,3 +27,4 @@ export declare function updateConfig<T>(mutator: (config: Config) => T, path?: s
     result: T;
 };
 export declare function writeConfig(config: Config, path?: string): void;
+export declare function reindexAfterRemoval(record: Record<number, number>, removedIndex: number): Record<number, number>;

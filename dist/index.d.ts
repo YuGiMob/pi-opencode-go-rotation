@@ -1,4 +1,6 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { formatResetIn } from "./format-time.ts";
+export { formatResetIn };
 export declare function shouldWatchProvider(provider: string | undefined): boolean;
 export type RateLimitKind = "transient" | "fixed-window-quota";
 export declare function classifyRateLimitError(message: string): RateLimitKind | undefined;
@@ -88,7 +90,6 @@ export declare class ProviderIdleWatchdog {
     private clear;
 }
 export declare function parseOpenCodeGoUsage(value: unknown): OpenCodeGoUsageResponse | undefined;
-export declare function formatResetIn(seconds: number): string;
 export declare function formatUsageStatus(result: UsageFetchResult): string;
 export declare function shortUsageWindowLabel(name: string | undefined, index: number): string;
 export interface FooterUsageOptions {

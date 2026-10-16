@@ -217,3 +217,13 @@ export function updateConfig<T>(mutator: (config: Config) => T, path = getConfig
 export function writeConfig(config: Config, path = getConfigPath()): void {
 	withLock(path, () => writeConfigUnlocked(path, config));
 }
+
+export function reindexAfterRemoval(record: Record<number, number>, removedIndex: number): Record<number, number> {
+	const shifted: Record<number, number> = {};
+	for (const [key, value] of Object.entries(record)) {
+		const index = Number(key);
+		if (index === removedIndex) continue;
+		shifted[index > removedIndex ? index - 1 : index] = value;
+	}
+	return shifted;
+}
