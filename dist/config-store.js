@@ -26,6 +26,7 @@ export function createEmptyConfig() {
         watchdogIdleMs: DEFAULT_WATCHDOG_IDLE_MS,
         cooldowns: {},
         quotaBlockedUntil: {},
+        authImportDeclined: false,
     };
 }
 export function getConfigPath() {
@@ -77,12 +78,16 @@ function parseConfig(value, path) {
     if (typeof watchdogIdleMs !== "number" || !Number.isFinite(watchdogIdleMs) || watchdogIdleMs < 1) {
         throw new ConfigLoadError(path, "watchdogIdleMs is invalid");
     }
+    const authImportDeclined = value.authImportDeclined ?? false;
+    if (typeof authImportDeclined !== "boolean")
+        throw new ConfigLoadError(path, "authImportDeclined is invalid");
     return {
         keys,
         activeKeyIndex,
         cooldownMinutes,
         watchdogEnabled,
         watchdogIdleMs,
+        authImportDeclined,
         cooldowns: parseNumberRecord(value.cooldowns, "cooldowns", path),
         quotaBlockedUntil: parseNumberRecord(value.quotaBlockedUntil, "quotaBlockedUntil", path),
     };

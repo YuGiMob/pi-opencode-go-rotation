@@ -22,6 +22,8 @@ Add your API keys:
 
 The first key added becomes active immediately.
 
+The extension never imports keys from `auth.json` automatically. When no keys are configured, `/opencode` offers to import the auth.json key once; declining is remembered and it is not asked again.
+
 ## Interactive key manager
 
 In interactive mode, `/opencode` (or `/opencode config`) opens the key manager overlay. It lists every key with its active, cooldown, or quota-blocked state, and lets you:
@@ -58,11 +60,12 @@ Usage commands use `https://opencode.ai/zen/go/v1/usage` and stop waiting after 
 
 ## Footer usage
 
-While the selected model uses the `opencode-go` provider, the extension keeps a status line in pi's footer with the active key's name, the usage windows, and the monthly renewal date:
+While the selected model uses the `opencode-go` provider, the extension keeps a status line in pi's footer with the active key's name, the weekly and monthly usage windows, and the monthly renewal date:
 
 ```text
-personal · 5h 12% · wk 40% · mo 55% | ↻ Nov 12
+personal: wk 40% · mo 55% | ↻ Nov 12
 ```
+The rolling 5-hour window is omitted from the footer.
 
 It refreshes on session start, model changes, turns, key rotations, manual key commands, and every 5 minutes. The active key's name leads the line, and switching to another provider clears it.
 
@@ -97,7 +100,8 @@ Keys are stored in `~/.pi/agent/opencode-keys.json` with file permissions `0600`
   "watchdogEnabled": true,
   "watchdogIdleMs": 90000,
   "cooldowns": {},
-  "quotaBlockedUntil": {}
+  "quotaBlockedUntil": {},
+  "authImportDeclined": false
 }
 ```
 

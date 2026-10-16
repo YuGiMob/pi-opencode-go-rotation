@@ -95,6 +95,9 @@ interface FakeContextState {
 	readonly notifications: string[];
 	aborts: number;
 	readonly statuses: Array<{ key: string; text: string | undefined }>;
+	authKey?: string;
+	confirmAnswer?: boolean;
+	readonly confirmations: string[];
 }
 
 function createContext(state: FakeContextState, registryShape: "authStorage" | "runtime" = "authStorage", withUi = false): ExtensionContext {
@@ -109,7 +112,7 @@ function createContext(state: FakeContextState, registryShape: "authStorage" | "
 	const context = {
 		model: { provider: "opencode-go", baseUrl: "https://example.test/opencode" },
 		modelRegistry: {
-			getApiKeyForProvider: async () => undefined,
+			getApiKeyForProvider: async () => state.authKey,
 			[registryShape]: keyStore,
 		},
 		hasUI: withUi,
@@ -119,6 +122,10 @@ function createContext(state: FakeContextState, registryShape: "authStorage" | "
 			},
 			setStatus: (key: string, text: string | undefined) => {
 				state.statuses.push({ key, text });
+			},
+			confirm: async (title: string, message: string) => {
+				state.confirmations.push(`${title}: ${message}`);
+				return state.confirmAnswer === true;
 			},
 		},
 		abort: () => {
@@ -149,6 +156,7 @@ function readConfig(path: string): {
 	cooldowns: Record<string, number>;
 	quotaBlockedUntil?: Record<string, number>;
 	keys: Array<{ name: string; key: string }>;
+	authImportDeclined?: boolean;
 } {
 	return JSON.parse(readFileSync(path, "utf-8"));
 }
@@ -205,7 +213,7 @@ function createHarness(registryShape: "authStorage" | "runtime" = "authStorage",
 	const timers = new FakeTimers();
 	const clock = new FakeClock();
 	const pi = new FakePi();
-	const state: FakeContextState = { runtimeKeys: [], notifications: [], aborts: 0, statuses: [] };
+	const state: FakeContextState = { runtimeKeys: [], notifications: [], aborts: 0, statuses: [], confirmations: [] };
 	const ctx = createContext(state, registryShape, withUi);
 	const extension = createOpencodeGoRotationExtension({ timers, clock, fetch });
 	extension(pi as unknown as ExtensionAPI);
@@ -253,31 +261,39 @@ test("usage footer formatting labels windows and reports errors", () => {
 			],
 			{ keyName: "work" },
 		),
-		"work · 5h 25% · wk ?",
+		"work: wk ?",
 	);
 	assert.equal(
 		formatFooterUsage([{ name: "weekly", status: "rate-limited", usagePercent: 100 }], { keyName: "work" }),
-		"work · wk 100% · rate-limited",
+		"work: wk 100% · rate-limited",
+	);
+	assert.equal(
+		formatFooterUsage([{ name: "rolling", status: "rate-limited", usagePercent: 100 }], { keyName: "work" }),
+		"work: rate-limited",
+	);
+	assert.equal(
+		formatFooterUsage([{ name: "rolling", status: "active", usagePercent: 12 }], { keyName: "work" }),
+		"work",
 	);
 	assert.equal(
 		formatFooterUsage(
 			[{ name: "monthly", status: "active", usagePercent: 70, resetAt: "2026-11-12T12:00:00Z" }],
 			{ keyName: "work", nowMs: Date.parse("2026-10-12T12:00:00Z") },
 		),
-		"work · mo 70% | ↻ Nov 12",
+		"work: mo 70% | ↻ Nov 12",
 	);
 	assert.equal(
 		formatFooterUsage(
 			[{ name: "monthly", status: "active", usagePercent: 70, resetInSec: 86_400 }],
 			{ keyName: "work", nowMs: Date.parse("2026-11-11T12:00:00Z") },
 		),
-		"work · mo 70% | ↻ Nov 12",
+		"work: mo 70% | ↻ Nov 12",
 	);
 	assert.equal(
 		formatFooterUsage([], { nowMs: 0, error: "Usage request failed." }),
-		"opencode-go · usage unavailable: Usage request failed.",
+		"opencode-go: usage unavailable: Usage request failed.",
 	);
-	assert.equal(formatFooterUsage([], { nowMs: 0 }), "opencode-go · no usage windows");
+	assert.equal(formatFooterUsage([], { nowMs: 0 }), "opencode-go: no usage windows");
 });
 
 test("session start publishes footer usage and a model change clears it", async () => {
@@ -293,7 +309,7 @@ test("session start publishes footer usage and a model change clears it", async 
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		assert.deepEqual(state.statuses.at(-1), {
 			key: "opencode-go-usage",
-			text: "one · 5h 12% · wk 40% · mo 100% · rate-limited | ↻ Nov 12",
+			text: "one: wk 40% · mo 100% · rate-limited | ↻ Nov 12",
 		});
 
 		(ctx as unknown as { model: { provider: string } }).model = { provider: "anthropic" };
@@ -1653,5 +1669,69 @@ test("/opencode without a subcommand falls back to status outside TUI mode", asy
 
 		assert.match(state.notifications.at(-1) ?? "", /one/);
 		assert.match(state.notifications.at(-1) ?? "", /Watchdog:/);
+	});
+});
+
+test("session start never imports auth.json keys automatically", async () => {
+	await withTempConfig(async (configPath) => {
+		writeFileSync(configPath, JSON.stringify({ keys: [] }), { mode: 0o600 });
+		const { pi, ctx, state } = createHarness("authStorage", undefined, true);
+		state.authKey = "sk-auth";
+		state.confirmAnswer = true;
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+
+		assert.deepEqual(state.runtimeKeys, []);
+		assert.equal(state.confirmations.length, 0);
+		assert.match(state.notifications.join("\n"), /No keys configured/);
+		assert.equal(readConfig(configPath).authImportDeclined, undefined);
+	});
+});
+
+test("/opencode imports the auth.json key when the prompt is accepted", async () => {
+	await withTempConfig(async (configPath) => {
+		writeFileSync(configPath, JSON.stringify({ keys: [] }), { mode: 0o600 });
+		const { pi, ctx, state } = createHarness("authStorage", undefined, true);
+		state.authKey = "sk-auth";
+		state.confirmAnswer = true;
+
+		await pi.runCommand("opencode", "", ctx);
+
+		assert.equal(state.confirmations.length, 1);
+		assert.deepEqual(state.runtimeKeys, ["sk-auth"]);
+		assert.match(state.notifications.join("\n"), /Imported key from auth.json/);
+	});
+});
+
+test("/opencode remembers a declined auth.json import", async () => {
+	await withTempConfig(async (configPath) => {
+		writeFileSync(configPath, JSON.stringify({ keys: [] }), { mode: 0o600 });
+		const { pi, ctx, state } = createHarness("authStorage", undefined, true);
+		state.authKey = "sk-auth";
+		state.confirmAnswer = false;
+
+		await pi.runCommand("opencode", "", ctx);
+
+		assert.equal(state.confirmations.length, 1);
+		assert.equal(readConfig(configPath).authImportDeclined, true);
+		assert.match(state.notifications.join("\n"), /will not ask again/);
+		assert.deepEqual(state.runtimeKeys, []);
+
+		await pi.runCommand("opencode", "", ctx);
+		assert.equal(state.confirmations.length, 1);
+	});
+});
+
+test("/opencode does not prompt for auth.json keys without a UI", async () => {
+	await withTempConfig(async (configPath) => {
+		writeFileSync(configPath, JSON.stringify({ keys: [] }), { mode: 0o600 });
+		const { pi, ctx, state } = createHarness();
+		state.authKey = "sk-auth";
+		state.confirmAnswer = true;
+
+		await pi.runCommand("opencode", "", ctx);
+
+		assert.equal(state.confirmations.length, 0);
+		assert.deepEqual(state.runtimeKeys, []);
 	});
 });

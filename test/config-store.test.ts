@@ -74,3 +74,26 @@ test("invalid JSON is reported without replacing the file with an empty config",
 		removeDirectory(directory);
 	}
 });
+
+test("authImportDeclined defaults to false and round-trips", () => {
+	const { directory, path } = makeConfigPath();
+	try {
+		writeConfig(createEmptyConfig(), path);
+		assert.equal(loadConfig(path).authImportDeclined, false);
+
+		writeConfig({ ...createEmptyConfig(), authImportDeclined: true }, path);
+		assert.equal(loadConfig(path).authImportDeclined, true);
+	} finally {
+		removeDirectory(directory);
+	}
+});
+
+test("invalid authImportDeclined is reported", () => {
+	const { directory, path } = makeConfigPath();
+	try {
+		writeFileSync(path, JSON.stringify({ keys: [], authImportDeclined: "yes" }), { mode: 0o600 });
+		assert.throws(() => loadConfig(path), (error: unknown) => error instanceof ConfigLoadError);
+	} finally {
+		removeDirectory(directory);
+	}
+});

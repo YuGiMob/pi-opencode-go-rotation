@@ -747,17 +747,21 @@ export interface FooterUsageOptions {
 }
 
 export function formatFooterUsage(windows: OpenCodeGoUsageWindow[], options: FooterUsageOptions = {}): string {
-	const prefix = `${options.keyName ?? "opencode-go"} · `;
-	if (options.error !== undefined) return `${prefix}usage unavailable: ${options.error}`;
-	if (windows.length === 0) return `${prefix}no usage windows`;
-	const parts = windows.map((window, index) => {
+	const name = options.keyName ?? "opencode-go";
+	if (options.error !== undefined) return `${name}: usage unavailable: ${options.error}`;
+	if (windows.length === 0) return `${name}: no usage windows`;
+	const parts: string[] = [];
+	windows.forEach((window, index) => {
 		const label = shortUsageWindowLabel(window.name, index);
+		if (label === "5h") return;
 		const percent = usageWindowPercent(window);
-		return `${label} ${percent === undefined ? "?" : `${Math.round(percent)}%`}`;
+		parts.push(`${label} ${percent === undefined ? "?" : `${Math.round(percent)}%`}`);
 	});
-	const rateLimited = windows.some((window) => window.status === "rate-limited");
+	if (windows.some((window) => window.status === "rate-limited")) parts.push("rate-limited");
 	const renewal = monthlyRenewalDate(windows, options.nowMs ?? Date.now());
-	return `${prefix}${parts.join(" · ")}${rateLimited ? " · rate-limited" : ""}${renewal === undefined ? "" : ` | ↻ ${formatRenewalDate(renewal)}`}`;
+	const renewalText = renewal === undefined ? "" : `↻ ${formatRenewalDate(renewal)}`;
+	if (parts.length === 0) return renewalText ? `${name}: ${renewalText}` : name;
+	return `${name}: ${parts.join(" · ")}${renewalText ? ` | ${renewalText}` : ""}`;
 }
 
 function monthlyRenewalDate(windows: OpenCodeGoUsageWindow[], nowMs: number): number | undefined {
@@ -1263,15 +1267,31 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			watchdog.start();
 		}
 
-		async function autoImportFromAuth(ctx: Pick<ExtensionContext, "modelRegistry" | "ui">): Promise<boolean> {
-			const authKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER);
-			if (!authKey) return false;
+		async function importAuthKey(authKey: string): Promise<boolean> {
 			const imported = mutateSharedConfig((freshConfig) => {
 				if (freshConfig.keys.some((entry) => entry.key === authKey)) return false;
 				freshConfig.keys.push({ name: "auth", key: authKey });
 				return true;
 			});
 			return imported === true;
+		}
+
+		async function promptAuthImport(ctx: Pick<ExtensionContext, "modelRegistry" | "ui" | "hasUI">): Promise<boolean> {
+			if (!ctx.hasUI || config.keys.length > 0 || config.authImportDeclined) return false;
+			const authKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER);
+			if (!authKey) return false;
+			const confirmed = await ctx.ui.confirm(
+				"OpenCode Go key found",
+				"An OpenCode Go API key exists in auth.json. Import it into the rotation config?",
+			);
+			if (confirmed === true) return await importAuthKey(authKey);
+			const persisted = mutateSharedConfig((freshConfig) => {
+				freshConfig.authImportDeclined = true;
+				return true;
+			});
+			if (persisted === true) ctx.ui.notify("OpenCode: auth.json import declined; /opencode will not ask again.", "info");
+			else if (configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
+			return false;
 		}
 
 		pi.on("session_start", async (event, ctx) => {
@@ -1308,17 +1328,9 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				return;
 			}
 			if (config.keys.length === 0) {
-				if (await autoImportFromAuth(ctx)) {
-					const keyName = applySynchronizedActiveKey(ctx);
-					if (keyName) ctx.ui.notify(`OpenCode: Imported key from auth.json → ${keyName}`, "info");
-				} else if (configError) {
-					ctx.ui.notify(`OpenCode: ${configError}.`, "error");
-					return;
-				} else {
-					ctx.ui.notify("OpenCode: No keys configured. Use /opencode add <name> <key>", "warning");
-					setUsageStatus(undefined);
-					return;
-				}
+				ctx.ui.notify("OpenCode: No keys configured. Run /opencode to add or import keys.", "warning");
+				setUsageStatus(undefined);
+				return;
 			}
 			applySynchronizedActiveKey(ctx);
 			syncUsageStatus(ctx, true);
@@ -1546,6 +1558,10 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 					case "":
 					case "config":
 					case "ui": {
+						if (await promptAuthImport(ctx)) {
+							const importedName = applySynchronizedActiveKey(ctx);
+							if (importedName) ctx.ui.notify(`OpenCode: Imported key from auth.json → ${importedName}`, "info");
+						}
 						if (ctx.mode !== "tui") {
 							ctx.ui.notify(formatStatus(config, now()), "info");
 							break;

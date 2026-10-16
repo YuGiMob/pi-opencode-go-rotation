@@ -38,6 +38,7 @@ export interface Config {
 	/** Key index → epoch ms when cooldown started */
 	cooldowns: Record<number, number>;
 	quotaBlockedUntil: Record<number, number>;
+	authImportDeclined: boolean;
 }
 
 export class ConfigLoadError extends Error {
@@ -59,6 +60,7 @@ export function createEmptyConfig(): Config {
 		watchdogIdleMs: DEFAULT_WATCHDOG_IDLE_MS,
 		cooldowns: {},
 		quotaBlockedUntil: {},
+		authImportDeclined: false,
 	};
 }
 
@@ -116,12 +118,16 @@ function parseConfig(value: unknown, path: string): Config {
 		throw new ConfigLoadError(path, "watchdogIdleMs is invalid");
 	}
 
+	const authImportDeclined = value.authImportDeclined ?? false;
+	if (typeof authImportDeclined !== "boolean") throw new ConfigLoadError(path, "authImportDeclined is invalid");
+
 	return {
 		keys,
 		activeKeyIndex,
 		cooldownMinutes,
 		watchdogEnabled,
 		watchdogIdleMs,
+		authImportDeclined,
 		cooldowns: parseNumberRecord(value.cooldowns, "cooldowns", path),
 		quotaBlockedUntil: parseNumberRecord(value.quotaBlockedUntil, "quotaBlockedUntil", path),
 	};

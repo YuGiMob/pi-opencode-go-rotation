@@ -32,6 +32,7 @@ function fixture(): Config {
 		watchdogIdleMs: 90_000,
 		cooldowns: {},
 		quotaBlockedUntil: {},
+		authImportDeclined: false,
 	};
 }
 

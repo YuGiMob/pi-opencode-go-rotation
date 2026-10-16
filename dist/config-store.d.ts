@@ -14,6 +14,7 @@ export interface Config {
     /** Key index → epoch ms when cooldown started */
     cooldowns: Record<number, number>;
     quotaBlockedUntil: Record<number, number>;
+    authImportDeclined: boolean;
 }
 export declare class ConfigLoadError extends Error {
     readonly path: string;
