@@ -1,6 +1,6 @@
 {
   "name": "@yugimob/pi-opencode-go-rotation",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Rotate between multiple OpenCode Go API keys with reactive 429, rate-limit, and watchdog stall detection, plus live footer usage for the active key",
   "type": "module",
   "main": "./dist/index.js",
