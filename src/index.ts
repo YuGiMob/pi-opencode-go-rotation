@@ -24,7 +24,6 @@ const USAGE_STATUS_REFRESH_MS = 60_000;
 const USAGE_STATUS_STALE_MS = 300_000;
 const USAGE_STATUS_DEBOUNCE_MS = 2_000;
 
-
 function getCooldownMs(config: Config): number {
 	return (config.cooldownMinutes || DEFAULT_COOLDOWN_MINUTES) * 60_000;
 }
@@ -54,7 +53,6 @@ interface RotateOptions {
 	now?: number;
 }
 
-
 export type ProviderActivityPhase = "waiting-for-response" | "waiting-for-stream" | "streaming";
 
 export interface ProviderTimeoutInfo {
@@ -68,7 +66,6 @@ export interface ProviderTimeoutInfo {
 export function shouldRotateAfterWatchdogTimeout(timeoutInfo: ProviderTimeoutInfo, rateLimitAlreadyRotated: boolean): boolean {
 	return timeoutInfo.lastStatus !== 401 && (timeoutInfo.lastStatus !== 429 || !rateLimitAlreadyRotated);
 }
-
 
 export interface ClockApi {
 	now(): number;
@@ -133,7 +130,6 @@ interface RequestRateLimitState {
 	readonly responseHandled: boolean;
 }
 
-
 export class ProviderIdleWatchdog {
 	private timer: unknown | undefined;
 	private active = false;
@@ -193,7 +189,6 @@ export class ProviderIdleWatchdog {
 		this.active = false;
 		this.clear();
 	}
-
 
 	consumeTimeoutInfo(): ProviderTimeoutInfo | undefined {
 		const result = this.timeoutInfo;
@@ -257,11 +252,26 @@ function getQuotaBlockedUntil(config: Config, keyIndex: number, now: number): nu
 		: undefined;
 }
 
+function allowsQuotaRotation(config: Config): boolean {
+	return config.rotationPolicy !== "off";
+}
+
+function allowsTransientRotation(config: Config): boolean {
+	return config.rotationPolicy === "full";
+}
+
+function allowsWatchdogRotation(config: Config): boolean {
+	return config.rotationPolicy === "full";
+}
+
 function pickAvailableKeyIndex(config: Config, now = Date.now()): number | undefined {
+	if (config.keys.length === 0) return undefined;
+	if (!allowsQuotaRotation(config)) return config.activeKeyIndex;
 	const cdMs = getCooldownMs(config);
 	for (let i = 0; i < config.keys.length; i++) {
 		const idx = (config.activeKeyIndex + i) % config.keys.length;
 		if (getQuotaBlockedUntil(config, idx, now) !== undefined) continue;
+		if (!allowsTransientRotation(config)) return idx;
 		const cooldownStart = config.cooldowns[idx];
 		if (cooldownStart === undefined || now - cooldownStart >= cdMs) return idx;
 	}
@@ -302,7 +312,6 @@ function rotateToNextKey(config: Config, options: RotateOptions = {}): number | 
 	return next;
 }
 
-
 interface RuntimeKeyStore {
 	setRuntimeApiKey(provider: string, key: string): void | Promise<void>;
 	removeRuntimeApiKey(provider: string): void | Promise<void>;
@@ -313,15 +322,9 @@ interface RuntimeKeyStoreHost {
 	runtime?: RuntimeKeyStore;
 }
 
-// Key equality detects credential changes, but persisted history has no issuer
-// provenance (including after reload). Never replay signed reasoning on this
-// rotating route, even before this process observes its first rotation.
 const droppedReasoningDetail = Symbol("dropped-caller-bound-reasoning");
 
 function projectReasoningDetails(details: unknown[]): unknown[] {
-	// map/filter, never flatMap: entries that are not plain reasoning detail
-	// objects (nested arrays, numbers, booleans, ...) must pass through as the
-	// same element in the same position, with their original shape intact.
 	return details
 		.map((detail) => {
 			if (!isRecord(detail)) return detail;
@@ -332,12 +335,6 @@ function projectReasoningDetails(details: unknown[]): unknown[] {
 		.filter((detail) => detail !== droppedReasoningDetail);
 }
 
-/**
- * Anthropic serializes signed thinking as `thinking` blocks and opaque redacted
- * reasoning as `redacted_thinking`. Emit the SDK's own unsigned shape instead: a
- * plain text block. Drop entries emptied by that projection, and report an
- * assistant message for omission only when the projection emptied it.
- */
 function projectAssistantContent(content: unknown[]): unknown[] | undefined {
 	let projected = false;
 	const result: unknown[] = [];
@@ -381,9 +378,6 @@ function sanitizeReasoningPayload(payload: unknown): unknown {
 			if (Array.isArray(message.reasoning_details)) {
 				const { reasoning_details: _details, ...visible } = projected;
 				const reasoning_details = projectReasoningDetails(message.reasoning_details);
-				// Strip the key entirely when nothing remains to send: an empty array is an
-				// unvalidated request shape, and this sanitiser exists to emit only shapes the
-				// provider accepts. Non-detail entries above keep identity/position/shape.
 				projected = reasoning_details.length === 0 ? visible : { ...visible, reasoning_details };
 			}
 			messages.push(projected);
@@ -410,7 +404,6 @@ function ignoreAsyncRefresh(result: void | Promise<void>): void {
 	void result?.catch(() => {});
 }
 
-/** Set the active key as runtime override (highest priority in auth chain). */
 function applyActiveKey(config: Config, modelRegistry: ModelRegistry, now = Date.now()): string | undefined {
 	const idx = pickAvailableKeyIndex(config, now);
 	if (idx === undefined) return undefined;
@@ -472,11 +465,6 @@ function captureSelectionSnapshot(config: Config, currentTime: number, keyIndex:
 	};
 }
 
-/**
- * A deferred decision owns one credential, selection, block and cooldown. Every later
- * mutation re-checks that exact snapshot under the lock, so an operation that started
- * before an external update can never write to the replacement state.
- */
 function matchesSelectionSnapshot(config: Config, snapshot: SelectionSnapshot, currentTime: number): boolean {
 	const entry = config.keys[snapshot.keyIndex];
 	if (entry === undefined) return false;
@@ -769,8 +757,9 @@ function usageWindowPercent(window: OpenCodeGoUsageWindow): number | undefined {
 
 function formatStatus(config: Config, now = Date.now()): string {
 	const watchdogStatus = `Watchdog: ${config.watchdogEnabled ? "on" : "off"} (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)`;
+	const policyStatus = `Rotation: ${config.rotationPolicy} (candidate verification ${config.verifyCandidates ? "on" : "off"})`;
 	if (config.keys.length === 0) {
-		return `No keys configured. Use /opencode add <name> <key>.\n${watchdogStatus}`;
+		return `No keys configured. Use /opencode add <name> <key>.\n${policyStatus}\n${watchdogStatus}`;
 	}
 	const cdMs = getCooldownMs(config);
 	return `${config.keys.map((key, i) => {
@@ -785,7 +774,7 @@ function formatStatus(config: Config, now = Date.now()): string {
 			if (remaining > 0) tag = ` [cooldown ${Math.ceil(remaining / 60_000)}m]`;
 		}
 		return `${marker} ${i + 1}. ${key.name}${tag}`;
-	}).join("\n")}\n${watchdogStatus}`;
+	}).join("\n")}\n${policyStatus}\n${watchdogStatus}`;
 }
 
 interface WatchdogEvent {
@@ -819,11 +808,6 @@ function formatWatchdogEvents(events: WatchdogEvent[], now = Date.now()): string
 		})
 		.join("\n");
 }
-
-
-// ---------------------------------------------------------------------------
-// Extension
-// ---------------------------------------------------------------------------
 
 export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}) {
 	return function opencodeGoRotationExtension(pi: ExtensionAPI) {
@@ -968,7 +952,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				usageStatusFetchedAt = receivedAt;
 				if (usageStatusCtx !== ctx) return;
 				if (!refreshConfig() || getActiveUsageTarget(config)?.keyIndex !== target.keyIndex) return;
-				if (usage.ok && hasExhaustedWindow(usage) && getQuotaBlockedUntil(config, target.keyIndex, receivedAt) === undefined) {
+				if (allowsQuotaRotation(config) && usage.ok && hasExhaustedWindow(usage) && getQuotaBlockedUntil(config, target.keyIndex, receivedAt) === undefined) {
 					mutateSharedConfig((freshConfig) => {
 						if (!matchesUsageTarget(freshConfig, target)) return;
 						if (getQuotaBlockedUntil(freshConfig, target.keyIndex, receivedAt) !== undefined) return;
@@ -1033,7 +1017,6 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			return captureRotationOperation(config, currentTime, config.activeKeyIndex, usageDecisionEpoch);
 		}
 
-		/** Post-await effects are allowed only while the completed decision still owns the state. */
 		function isCompletionCurrent(outcome: RotationOutcome): outcome is RotationCompletion {
 			return (outcome.kind === "rotated" || outcome.kind === "none")
 				&& refreshConfig()
@@ -1050,19 +1033,21 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				if (getQuotaBlockedUntil(config, candidateIndex, currentTime) !== undefined) continue;
 				const candidate = captureSelectionSnapshot(config, currentTime, candidateIndex);
 				if (!candidate) continue;
-				const usage = await fetchOpenCodeGoUsage(candidate, fetchApi, options.timers);
-				if (usageDecisionEpoch !== operation.epoch) return { kind: "cancelled" };
-				if (usage.ok && hasExhaustedWindow(usage)) {
-					const blockedUntil = getExhaustedUntil(usage.usage, currentTime, getCooldownMs(config));
-					const blocked = mutateSharedConfig((freshConfig): LockedStep<true> => {
-						if (!isRotationOperationCurrent(operation, freshConfig, usageDecisionEpoch)) return { outcome: "cancelled" };
-						if (!matchesSelectionSnapshot(freshConfig, candidate, currentTime)) return { outcome: "cancelled" };
-						setQuotaBlock(freshConfig, candidate.keyIndex, blockedUntil, currentTime);
-						return { outcome: "done", value: true };
-					});
-					if (blocked === undefined) return { kind: "unavailable" };
-					if (blocked.outcome === "cancelled") return { kind: "cancelled" };
-					continue;
+				if (config.verifyCandidates) {
+					const usage = await fetchOpenCodeGoUsage(candidate, fetchApi, options.timers);
+					if (usageDecisionEpoch !== operation.epoch) return { kind: "cancelled" };
+					if (usage.ok && hasExhaustedWindow(usage)) {
+						const blockedUntil = getExhaustedUntil(usage.usage, currentTime, getCooldownMs(config));
+						const blocked = mutateSharedConfig((freshConfig): LockedStep<true> => {
+							if (!isRotationOperationCurrent(operation, freshConfig, usageDecisionEpoch)) return { outcome: "cancelled" };
+							if (!matchesSelectionSnapshot(freshConfig, candidate, currentTime)) return { outcome: "cancelled" };
+							setQuotaBlock(freshConfig, candidate.keyIndex, blockedUntil, currentTime);
+							return { outcome: "done", value: true };
+						});
+						if (blocked === undefined) return { kind: "unavailable" };
+						if (blocked.outcome === "cancelled") return { kind: "cancelled" };
+						continue;
+					}
 				}
 				const committed = mutateSharedConfig((freshConfig): LockedStep<number> => {
 					if (!isRotationOperationCurrent(operation, freshConfig, usageDecisionEpoch)) return { outcome: "cancelled" };
@@ -1127,7 +1112,9 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		function rotateForWatchdog(ctx: Pick<ExtensionContext, "modelRegistry" | "ui">, timeoutInfo: ProviderTimeoutInfo, rateLimitAlreadyRotated: boolean): { keyName?: string; rotated: boolean } {
 			if (!refreshConfig()) return { rotated: false };
 			const currentTime = now();
-			if (config.keys.length <= 1) return { rotated: false };
+			if (config.keys.length <= 1 || !allowsWatchdogRotation(config)) {
+				return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated: false };
+			}
 			if (shouldRotateAfterWatchdogTimeout(timeoutInfo, rateLimitAlreadyRotated)) {
 				const previousIndex = config.activeKeyIndex;
 				const nextIndex = mutateSharedConfig((freshConfig) => rotateToNextKey(freshConfig, { now: currentTime }));
@@ -1218,7 +1205,6 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			stopUsageStatusTimer();
 			usageStatusCtx = ctx;
 			if (!ensureConfig(ctx)) return;
-			// On reload: re-apply active key, skip auto-import
 			if (event.reason === "reload") {
 				applySynchronizedActiveKey(ctx);
 				syncUsageStatus(ctx, true);
@@ -1293,20 +1279,29 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				const blockedUntil = authoritativeReset ?? currentTime + getCooldownMs(config);
 				const exhaustedName = config.keys[requestState.decision.target.keyIndex]?.name
 					|| `key-${requestState.decision.target.keyIndex + 1}`;
+				const persistQuotaBlock = (): boolean | undefined => mutateSharedConfig((freshConfig) => {
+					if (!matchesUsageTarget(freshConfig, requestState.decision.target)) return false;
+					if (authoritativeReset === undefined) {
+						setQuotaBlock(freshConfig, requestState.decision.target.keyIndex, blockedUntil, currentTime);
+					} else {
+						freshConfig.quotaBlockedUntil[requestState.decision.target.keyIndex] = authoritativeReset;
+					}
+					return true;
+				});
 				if (requestState.responseHandled) {
-					const persisted = mutateSharedConfig((freshConfig) => {
-						// The handled response may upgrade the reset of its own credential, but never
-						// of whatever credential now occupies that index.
-						if (!matchesUsageTarget(freshConfig, requestState.decision.target)) return false;
-						if (authoritativeReset === undefined) {
-							setQuotaBlock(freshConfig, requestState.decision.target.keyIndex, blockedUntil, currentTime);
-						} else {
-							freshConfig.quotaBlockedUntil[requestState.decision.target.keyIndex] = authoritativeReset;
-						}
-						return true;
-					});
+					const persisted = persistQuotaBlock();
 					if (persisted !== true && configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
 					invalidateAutomaticDecisions();
+					return;
+				}
+				if (!allowsQuotaRotation(config) || (authoritativeReset === undefined && !allowsTransientRotation(config))) {
+					const persisted = persistQuotaBlock();
+					if (persisted !== true && configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
+					invalidateAutomaticDecisions();
+					const reason = allowsQuotaRotation(config)
+						? "no reset time was reported"
+						: `rotationPolicy is ${config.rotationPolicy}`;
+					ctx.ui.notify(`OpenCode: ${exhaustedName} reached its plan quota; not rotating automatically (${reason}).`, "warning");
 					return;
 				}
 				const operation = currentRotationOperation(currentTime);
@@ -1337,6 +1332,12 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				return;
 			}
 
+			if (!allowsTransientRotation(config)) {
+				invalidateAutomaticDecisions();
+				const limitedName = config.keys[requestState.decision.target.keyIndex]?.name || `key-${requestState.decision.target.keyIndex + 1}`;
+				ctx.ui.notify(`OpenCode: ${limitedName} hit a rate limit; not rotating (rotationPolicy=${config.rotationPolicy}).`, "warning");
+				return;
+			}
 			if (config.keys.length <= 1) {
 				invalidateAutomaticDecisions();
 				ctx.ui.notify("OpenCode: Rate limited — no other keys to rotate to.", "warning");
@@ -1353,7 +1354,6 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				ctx.ui.notify(`OpenCode: ${configError}. Automatic rotation was skipped.`, "error");
 				return;
 			}
-			// Never finalize a decision that lost ownership while the rotation was in flight.
 			if (!isCompletionCurrent(outcome)) return;
 			if (outcome.kind === "none") {
 				invalidateAutomaticDecisions();
@@ -1376,7 +1376,6 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			const decision = requestState.decision;
 			const operation = currentRotationOperation(now());
 			if (!operation || operation.selection.keyIndex !== decision.target.keyIndex) return;
-			// Bookkeeping for this response is allowed only while it still owns the request state.
 			const markHandledIfOwned = () => {
 				if (requestRateLimitState === requestState) markResponseRateLimitHandled(decision);
 			};
@@ -1387,6 +1386,13 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			const currentTime = now();
 			const exhaustedName = config.keys[decision.target.keyIndex]?.name || `key-${decision.target.keyIndex + 1}`;
 			if (usage.ok && hasExhaustedWindow(usage)) {
+				if (!allowsQuotaRotation(config)) {
+					invalidateAutomaticDecisions();
+					if (event.status === 429) markHandledIfOwned();
+					ctx.ui.notify(`OpenCode: ${exhaustedName} reached its plan quota; not rotating (rotationPolicy=${config.rotationPolicy}).`, "warning");
+					ctx.ui.notify(formatUsageStatus(usage), "warning");
+					return;
+				}
 				const outcome = await rotateWithRecovery(operation, currentTime, {
 					kind: "quota",
 					blockedUntil: getExhaustedUntil(usage.usage, currentTime, getCooldownMs(config)),
@@ -1409,7 +1415,14 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				ctx.ui.notify(formatUsageStatus(usage), "warning");
 				return;
 			}
-			if (event.status === 401) return;
+			if (event.status === 401) {
+				if (!allowsTransientRotation(config)) {
+					invalidateAutomaticDecisions();
+					ctx.ui.notify(`OpenCode: ${exhaustedName} was rejected with HTTP 401; not rotating (rotationPolicy=${config.rotationPolicy}).`, "warning");
+				}
+				return;
+			}
+			if (!allowsTransientRotation(config)) return;
 			if (config.keys.length <= 1) {
 				markHandledIfOwned();
 				return;
@@ -1674,9 +1687,52 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 						break;
 					}
 
+					case "policy": {
+						const value = parts[1];
+						if (value === undefined) {
+							ctx.ui.notify(`Rotation policy: ${config.rotationPolicy} (candidate verification ${config.verifyCandidates ? "on" : "off"})`, "info");
+							return;
+						}
+						const policy = value === "quota" ? "quota-only" : value;
+						if (policy !== "off" && policy !== "quota-only" && policy !== "full") {
+							ctx.ui.notify("Usage: /opencode policy [off|quota-only|full]", "warning");
+							return;
+						}
+						const result = mutateSharedConfig((freshConfig) => {
+							freshConfig.rotationPolicy = policy;
+							return true;
+						});
+						if (result !== true) {
+							if (configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
+							return;
+						}
+						invalidateAutomaticDecisions();
+						ctx.ui.notify(`Rotation policy set to ${policy}`, "info");
+						break;
+					}
+
+					case "verify": {
+						const value = parts[1];
+						if (value !== "on" && value !== "off") {
+							ctx.ui.notify(`Usage: /opencode verify <on|off> (currently ${config.verifyCandidates ? "on" : "off"})`, "info");
+							return;
+						}
+						const enabled = value === "on";
+						const result = mutateSharedConfig((freshConfig) => {
+							freshConfig.verifyCandidates = enabled;
+							return true;
+						});
+						if (result !== true) {
+							if (configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
+							return;
+						}
+						ctx.ui.notify(`Candidate verification ${enabled ? "enabled" : "disabled"}`, "info");
+						break;
+					}
+
 					default:
 						ctx.ui.notify(
-							"Usage: /opencode [config|status|usage|quota|events|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|watchdog [status|on|off|<seconds>]]",
+							"Usage: /opencode [config|status|usage|quota|events|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|policy [off|quota-only|full]|verify <on|off>|watchdog [status|on|off|<seconds>]]",
 							"info",
 						);
 				}

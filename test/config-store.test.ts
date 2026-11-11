@@ -97,3 +97,39 @@ test("invalid authImportDeclined is reported", () => {
 		removeDirectory(directory);
 	}
 });
+
+test("rotation policy defaults to quota-only with candidate verification off", () => {
+	const { directory, path } = makeConfigPath();
+	try {
+		writeFileSync(path, JSON.stringify({ keys: [{ name: "one", key: "sk-one" }] }), { mode: 0o600 });
+		const config = loadConfig(path);
+		assert.equal(config.rotationPolicy, "quota-only");
+		assert.equal(config.verifyCandidates, false);
+	} finally {
+		removeDirectory(directory);
+	}
+});
+
+test("rotation policy and candidate verification round-trip", () => {
+	const { directory, path } = makeConfigPath();
+	try {
+		writeConfig({ ...createEmptyConfig(), rotationPolicy: "full", verifyCandidates: true }, path);
+		const config = loadConfig(path);
+		assert.equal(config.rotationPolicy, "full");
+		assert.equal(config.verifyCandidates, true);
+	} finally {
+		removeDirectory(directory);
+	}
+});
+
+test("invalid rotation policy and candidate verification are reported", () => {
+	const { directory, path } = makeConfigPath();
+	try {
+		writeFileSync(path, JSON.stringify({ keys: [], rotationPolicy: "sometimes" }), { mode: 0o600 });
+		assert.throws(() => loadConfig(path), (error: unknown) => error instanceof ConfigLoadError);
+		writeFileSync(path, JSON.stringify({ keys: [], verifyCandidates: "yes" }), { mode: 0o600 });
+		assert.throws(() => loadConfig(path), (error: unknown) => error instanceof ConfigLoadError);
+	} finally {
+		removeDirectory(directory);
+	}
+});

@@ -5,6 +5,7 @@
     "rewriteRelativeImportExtensions": true,
     "declaration": true,
     "noEmit": false,
+    "removeComments": true,
     "outDir": "dist",
     "rootDir": "src"
   },

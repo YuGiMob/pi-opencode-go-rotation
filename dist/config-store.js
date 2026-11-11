@@ -5,6 +5,8 @@ import { randomUUID } from "node:crypto";
 export const CONFIG_PATH_ENV = "PI_OPENCODE_ROTATION_CONFIG";
 export const DEFAULT_COOLDOWN_MINUTES = 60;
 export const DEFAULT_WATCHDOG_IDLE_MS = 90_000;
+const DEFAULT_ROTATION_POLICY = "quota-only";
+const DEFAULT_VERIFY_CANDIDATES = false;
 const CONFIG_FILE_MODE = 0o600;
 const LOCK_TIMEOUT_MS = 10_000;
 const LOCK_STALE_MS = 30_000;
@@ -24,6 +26,8 @@ export function createEmptyConfig() {
         cooldownMinutes: DEFAULT_COOLDOWN_MINUTES,
         watchdogEnabled: true,
         watchdogIdleMs: DEFAULT_WATCHDOG_IDLE_MS,
+        rotationPolicy: DEFAULT_ROTATION_POLICY,
+        verifyCandidates: DEFAULT_VERIFY_CANDIDATES,
         cooldowns: {},
         quotaBlockedUntil: {},
         authImportDeclined: false,
@@ -78,6 +82,14 @@ function parseConfig(value, path) {
     if (typeof watchdogIdleMs !== "number" || !Number.isFinite(watchdogIdleMs) || watchdogIdleMs < 1) {
         throw new ConfigLoadError(path, "watchdogIdleMs is invalid");
     }
+    const rotationPolicyValue = value.rotationPolicy;
+    const rotationPolicy = rotationPolicyValue === undefined ? DEFAULT_ROTATION_POLICY : rotationPolicyValue;
+    if (rotationPolicy !== "off" && rotationPolicy !== "quota-only" && rotationPolicy !== "full") {
+        throw new ConfigLoadError(path, "rotationPolicy is invalid");
+    }
+    const verifyCandidates = value.verifyCandidates ?? DEFAULT_VERIFY_CANDIDATES;
+    if (typeof verifyCandidates !== "boolean")
+        throw new ConfigLoadError(path, "verifyCandidates is invalid");
     const authImportDeclined = value.authImportDeclined ?? false;
     if (typeof authImportDeclined !== "boolean")
         throw new ConfigLoadError(path, "authImportDeclined is invalid");
@@ -87,6 +99,8 @@ function parseConfig(value, path) {
         cooldownMinutes,
         watchdogEnabled,
         watchdogIdleMs,
+        rotationPolicy,
+        verifyCandidates,
         authImportDeclined,
         cooldowns: parseNumberRecord(value.cooldowns, "cooldowns", path),
         quotaBlockedUntil: parseNumberRecord(value.quotaBlockedUntil, "quotaBlockedUntil", path),
@@ -127,9 +141,7 @@ function acquireLock(path) {
                     continue;
                 }
             }
-            catch {
-                // The other process may have released the lock between stat and removal.
-            }
+            catch { }
             if (Date.now() - startedAt >= LOCK_TIMEOUT_MS) {
                 throw new Error(`Timed out waiting for OpenCode rotation config lock: ${lockPath}`);
             }

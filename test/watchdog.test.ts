@@ -37,7 +37,6 @@ class FakeClock {
 	}
 }
 
-
 test("shouldWatchProvider only enables the watchdog for opencode-go", () => {
 	assert.equal(shouldWatchProvider("opencode-go"), true);
 	assert.equal(shouldWatchProvider("anthropic"), false);

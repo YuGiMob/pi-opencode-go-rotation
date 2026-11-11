@@ -1,6 +1,7 @@
 export declare const CONFIG_PATH_ENV = "PI_OPENCODE_ROTATION_CONFIG";
 export declare const DEFAULT_COOLDOWN_MINUTES = 60;
 export declare const DEFAULT_WATCHDOG_IDLE_MS = 90000;
+export type RotationPolicy = "off" | "quota-only" | "full";
 export interface KeyEntry {
     name: string;
     key: string;
@@ -11,7 +12,8 @@ export interface Config {
     cooldownMinutes: number;
     watchdogEnabled: boolean;
     watchdogIdleMs: number;
-    /** Key index → epoch ms when cooldown started */
+    rotationPolicy: RotationPolicy;
+    verifyCandidates: boolean;
     cooldowns: Record<number, number>;
     quotaBlockedUntil: Record<number, number>;
     authImportDeclined: boolean;

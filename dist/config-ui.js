@@ -454,7 +454,21 @@ export async function openOpencodeConfig(ctx) {
                 label: "Watchdog",
                 currentValue: current.watchdogEnabled ? "on" : "off",
                 values: ["on", "off"],
-                description: "Abort and rotate an opencode-go request that stalls with no response or stream activity.",
+                description: "Abort an opencode-go request that stalls with no response or stream activity and retry it.",
+            });
+            items.push({
+                id: "rotationPolicy",
+                label: "Rotation policy",
+                currentValue: current.rotationPolicy,
+                values: ["off", "quota-only", "full"],
+                description: "off never rotates automatically. quota-only rotates on a confirmed exhausted window or a parsed reset. full also rotates on transient limits and stalls.",
+            });
+            items.push({
+                id: "verifyCandidates",
+                label: "Verify candidates",
+                currentValue: current.verifyCandidates ? "on" : "off",
+                values: ["on", "off"],
+                description: "Check a candidate key's usage before switching to it.",
             });
             items.push({
                 id: "watchdogIdle",
@@ -513,20 +527,37 @@ export async function openOpencodeConfig(ctx) {
             container.clear();
             container.addChild(rule(tui, theme));
             container.addChild(new tui.Text(theme.fg("accent", theme.bold("OpenCode Go keys")), 1, 0));
-            container.addChild(new tui.Text(theme.fg("dim", "Keys, cooldowns, quota blocks, and the stall watchdog. Esc closes."), 1, 0));
+            container.addChild(new tui.Text(theme.fg("dim", "Keys, rotation policy, cooldowns, quota blocks, and the stall watchdog. Esc closes."), 1, 0));
             container.addChild(list);
             container.addChild(status);
             container.addChild(rule(tui, theme));
             interactive.requestRender();
         };
         const onChange = (id, value) => {
-            if (id !== "watchdog")
+            if (id === "watchdog") {
+                const enabled = value === "on";
+                if (persist((fresh) => {
+                    fresh.watchdogEnabled = enabled;
+                }) === undefined)
+                    rebuild("watchdog");
                 return;
-            const enabled = value === "on";
-            if (persist((fresh) => {
-                fresh.watchdogEnabled = enabled;
-            }) === undefined) {
-                rebuild("watchdog");
+            }
+            if (id === "rotationPolicy") {
+                if (value !== "off" && value !== "quota-only" && value !== "full")
+                    return;
+                const policy = value;
+                if (persist((fresh) => {
+                    fresh.rotationPolicy = policy;
+                }) === undefined)
+                    rebuild("rotationPolicy");
+                return;
+            }
+            if (id === "verifyCandidates") {
+                const enabled = value === "on";
+                if (persist((fresh) => {
+                    fresh.verifyCandidates = enabled;
+                }) === undefined)
+                    rebuild("verifyCandidates");
             }
         };
         rebuild();

@@ -132,7 +132,6 @@ function createContext(state: FakeContextState, registryShape: "authStorage" | "
 			state.aborts++;
 		},
 	};
-	// Test double: this object implements only the ExtensionContext fields used by this extension.
 	return context as unknown as ExtensionContext;
 }
 
@@ -147,6 +146,8 @@ function writeConfig(path: string): void {
 		cooldownMinutes: 60,
 		watchdogEnabled: true,
 		watchdogIdleMs: 90_000,
+		rotationPolicy: "full",
+		verifyCandidates: true,
 		cooldowns: {},
 	}), { mode: 0o600 });
 }
@@ -157,6 +158,8 @@ function readConfig(path: string): {
 	quotaBlockedUntil?: Record<string, number>;
 	keys: Array<{ name: string; key: string }>;
 	authImportDeclined?: boolean;
+	rotationPolicy?: string;
+	verifyCandidates?: boolean;
 } {
 	return JSON.parse(readFileSync(path, "utf-8"));
 }
@@ -1128,10 +1131,6 @@ test("config writes restore private file permissions", async () => {
 	});
 });
 
-// ---------------------------------------------------------------------------
-// Caller-bound reasoning projection (Chat Completions, Responses, Anthropic)
-// ---------------------------------------------------------------------------
-
 const toolMessage = { role: "tool", tool_call_id: "done", content: "Saved" };
 const responsesToolResult = { type: "function_call_output", call_id: "done", output: "Saved" };
 const nestedReasoningEntry = [{ signature: "nested" }];
@@ -1259,7 +1258,6 @@ test("chat and responses projection preserves element identity and other blocks"
 		};
 		const payload = { messages: [assistant, tool] };
 
-		// The hook returns the replacement payload as `unknown`; this test inspects its identity.
 		const output = await pi.emit("before_provider_request", { payload }, ctx) as {
 			messages: Array<{ reasoning_details: unknown[]; tool_calls: unknown }>;
 		};
@@ -1289,7 +1287,6 @@ async function serializeAnthropicTurn(history: Context): Promise<unknown> {
 	await pi.runCommand("opencode", "use 2", ctx);
 	let outgoing: unknown;
 	await streamAnthropic(model, history, {
-		// Test double: stops before the Anthropic client can be used, so no network call happens.
 		client: { messages: { create: () => { throw new Error("network must not be reached"); } } } as unknown as AnthropicOptions["client"],
 		cacheRetention: "none",
 		onPayload: async (payload) => {
@@ -1323,7 +1320,6 @@ test("real Anthropic serialization drops caller-bound reasoning before any netwo
 
 		const outgoing = await serializeAnthropicTurn(history);
 
-		// The hook returns the replacement payload as `unknown`; this test inspects its concrete messages.
 		const serialized = outgoing as { messages: unknown[] };
 		assert.deepEqual(serialized.messages, [
 			{ role: "user", content: "Finish" },
@@ -1604,5 +1600,149 @@ test("/opencode does not prompt for auth.json keys without a UI", async () => {
 
 		assert.equal(state.confirmations.length, 0);
 		assert.deepEqual(state.runtimeKeys, []);
+	});
+});
+
+test("quota-only policy aborts a stalled request without rotating", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { rotationPolicy: "quota-only" });
+		const { pi, ctx, state, timers, clock } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		clock.advance(90_000);
+		timers.fireAll();
+		const result = await pi.emit("message_end", {
+			message: { role: "assistant", provider: "opencode-go", stopReason: "abort", errorMessage: "" },
+		}, ctx);
+
+		assert.equal(state.aborts, 1);
+		assert.deepEqual(state.runtimeKeys, ["sk-one"]);
+		assert.equal(readConfig(configPath).activeKeyIndex, 0);
+		assert.deepEqual(readConfig(configPath).cooldowns, {});
+		assert.match(JSON.stringify(result), /using one/);
+	});
+});
+
+test("quota-only policy does not rotate on an unconfirmed 429", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { rotationPolicy: "quota-only" });
+		const { pi, ctx, state } = createHarness("authStorage", usagePerKey({ "sk-one": activeUsage() }));
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+		await pi.emit("message_end", assistantError(transientError), ctx);
+
+		assert.deepEqual(state.runtimeKeys, ["sk-one"]);
+		assert.equal(readConfig(configPath).activeKeyIndex, 0);
+		assert.match(state.notifications.join("\n"), /not rotating/);
+	});
+});
+
+test("quota-only policy rotates when usage confirms an exhausted window", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { rotationPolicy: "quota-only" });
+		const fetch = usagePerKey({
+			"sk-one": usageResponse([{ name: "weekly", status: "rate-limited", usagePercent: 100, resetInSec: 3_600 }]),
+		});
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.equal(readConfig(configPath).activeKeyIndex, 1);
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], 3_600_000);
+	});
+});
+
+test("off policy keeps the configured key on an exhausted window", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { rotationPolicy: "off" });
+		const fetch = usagePerKey({
+			"sk-one": usageResponse([{ name: "weekly", status: "rate-limited", usagePercent: 100, resetInSec: 3_600 }]),
+		});
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+
+		assert.deepEqual(state.runtimeKeys, ["sk-one"]);
+		assert.equal(readConfig(configPath).activeKeyIndex, 0);
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], undefined);
+		assert.match(state.notifications.join("\n"), /not rotating \(rotationPolicy=off\)/);
+	});
+});
+
+test("disabled candidate verification never probes another key", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { rotationPolicy: "quota-only", verifyCandidates: false });
+		const tokens: string[] = [];
+		const fetch: FetchApi = async (_url, init) => {
+			tokens.push((init.headers.Authorization ?? "").replace(/^Bearer\s+/, ""));
+			return usageResponse([{ name: "weekly", status: "rate-limited", usagePercent: 100, resetInSec: 3_600 }]);
+		};
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+
+		assert.deepEqual(tokens, ["sk-one"]);
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+	});
+});
+
+test("the policy command reports and updates the rotation policy", async () => {
+	await withTempConfig(async (configPath) => {
+		const { pi, ctx, state } = createHarness();
+
+		await pi.runCommand("opencode", "policy", ctx);
+		assert.match(state.notifications.at(-1) ?? "", /Rotation policy: full \(candidate verification on\)/);
+
+		await pi.runCommand("opencode", "policy off", ctx);
+		assert.equal(readConfig(configPath).rotationPolicy, "off");
+		assert.match(state.notifications.at(-1) ?? "", /Rotation policy set to off/);
+
+		await pi.runCommand("opencode", "policy quota", ctx);
+		assert.equal(readConfig(configPath).rotationPolicy, "quota-only");
+	});
+});
+
+test("quota-only policy rotates on a fixed-window error with a parseable reset", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { rotationPolicy: "quota-only" });
+		const { pi, ctx, state } = createHarness();
+		const quotaError = "You have exceeded the 5-hour usage quota. It will reset at 2026-08-01T12:00:00Z";
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("message_end", {
+			message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage: quotaError },
+		}, ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], Date.parse("2026-08-01T12:00:00Z"));
+	});
+});
+
+test("quota-only policy blocks an unparseable fixed-window error without rotating", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { rotationPolicy: "quota-only" });
+		const { pi, ctx, state } = createHarness();
+		const quotaError = "You have exceeded the weekly usage quota.";
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("message_end", {
+			message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage: quotaError },
+		}, ctx);
+
+		assert.deepEqual(state.runtimeKeys, ["sk-one"]);
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], 3_600_000);
+		assert.match(state.notifications.join("\n"), /no reset time was reported/);
 	});
 });

@@ -18,11 +18,15 @@ import { randomUUID } from "node:crypto";
 export const CONFIG_PATH_ENV = "PI_OPENCODE_ROTATION_CONFIG";
 export const DEFAULT_COOLDOWN_MINUTES = 60;
 export const DEFAULT_WATCHDOG_IDLE_MS = 90_000;
+const DEFAULT_ROTATION_POLICY: RotationPolicy = "quota-only";
+const DEFAULT_VERIFY_CANDIDATES = false;
 
 const CONFIG_FILE_MODE = 0o600;
 const LOCK_TIMEOUT_MS = 10_000;
 const LOCK_STALE_MS = 30_000;
 const LOCK_RETRY_MS = 10;
+
+export type RotationPolicy = "off" | "quota-only" | "full";
 
 export interface KeyEntry {
 	name: string;
@@ -35,7 +39,8 @@ export interface Config {
 	cooldownMinutes: number;
 	watchdogEnabled: boolean;
 	watchdogIdleMs: number;
-	/** Key index → epoch ms when cooldown started */
+	rotationPolicy: RotationPolicy;
+	verifyCandidates: boolean;
 	cooldowns: Record<number, number>;
 	quotaBlockedUntil: Record<number, number>;
 	authImportDeclined: boolean;
@@ -58,6 +63,8 @@ export function createEmptyConfig(): Config {
 		cooldownMinutes: DEFAULT_COOLDOWN_MINUTES,
 		watchdogEnabled: true,
 		watchdogIdleMs: DEFAULT_WATCHDOG_IDLE_MS,
+		rotationPolicy: DEFAULT_ROTATION_POLICY,
+		verifyCandidates: DEFAULT_VERIFY_CANDIDATES,
 		cooldowns: {},
 		quotaBlockedUntil: {},
 		authImportDeclined: false,
@@ -118,6 +125,15 @@ function parseConfig(value: unknown, path: string): Config {
 		throw new ConfigLoadError(path, "watchdogIdleMs is invalid");
 	}
 
+	const rotationPolicyValue = value.rotationPolicy;
+	const rotationPolicy = rotationPolicyValue === undefined ? DEFAULT_ROTATION_POLICY : rotationPolicyValue;
+	if (rotationPolicy !== "off" && rotationPolicy !== "quota-only" && rotationPolicy !== "full") {
+		throw new ConfigLoadError(path, "rotationPolicy is invalid");
+	}
+
+	const verifyCandidates = value.verifyCandidates ?? DEFAULT_VERIFY_CANDIDATES;
+	if (typeof verifyCandidates !== "boolean") throw new ConfigLoadError(path, "verifyCandidates is invalid");
+
 	const authImportDeclined = value.authImportDeclined ?? false;
 	if (typeof authImportDeclined !== "boolean") throw new ConfigLoadError(path, "authImportDeclined is invalid");
 
@@ -127,6 +143,8 @@ function parseConfig(value: unknown, path: string): Config {
 		cooldownMinutes,
 		watchdogEnabled,
 		watchdogIdleMs,
+		rotationPolicy,
+		verifyCandidates,
 		authImportDeclined,
 		cooldowns: parseNumberRecord(value.cooldowns, "cooldowns", path),
 		quotaBlockedUntil: parseNumberRecord(value.quotaBlockedUntil, "quotaBlockedUntil", path),
@@ -167,9 +185,7 @@ function acquireLock(path: string): string {
 					rmSync(lockPath, { recursive: true, force: true });
 					continue;
 				}
-			} catch {
-				// The other process may have released the lock between stat and removal.
-			}
+			} catch {}
 
 			if (Date.now() - startedAt >= LOCK_TIMEOUT_MS) {
 				throw new Error(`Timed out waiting for OpenCode rotation config lock: ${lockPath}`);
