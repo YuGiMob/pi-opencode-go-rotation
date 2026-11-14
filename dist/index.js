@@ -3,6 +3,8 @@ import { openOpencodeConfig, removeKey } from "./config-ui.js";
 import { formatDuration, formatResetIn } from "./format-time.js";
 export { formatResetIn };
 const PROVIDER = "opencode-go";
+const OPENCODE_KEY_ENV = "OPENCODE_API_KEY";
+const AMBIENT_KEY_NAME = "env";
 const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 const OPENCODE_GO_USAGE_TIMEOUT_MS = 10_000;
 const FIXED_WINDOW_QUOTA_RE = /\b(?:5[- ]hour|weekly|monthly)\b[\s\S]*\b(?:usage\s+)?(?:quota|limit)\b|\b(?:usage|plan)\s+allocated\s+quota\s+exceeded\b|\b(?:quota|limit)\b[\s\S]*\b(?:will\s+reset|resets?\s+at|fixed[- ]window)\b/i;
@@ -611,11 +613,14 @@ function usageWindowPercent(window) {
         return (window.used / window.limit) * 100;
     return undefined;
 }
-function formatStatus(config, now = Date.now()) {
+function formatStatus(config, now = Date.now(), ambientKeyApplied = false) {
     const watchdogStatus = `Watchdog: ${config.watchdogEnabled ? "on" : "off"} (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)`;
     const policyStatus = `Rotation: ${config.rotationPolicy} (candidate verification ${config.verifyCandidates ? "on" : "off"})`;
     if (config.keys.length === 0) {
-        return `No keys configured. Use /opencode add <name> <key>.\n${policyStatus}\n${watchdogStatus}`;
+        const keyStatus = ambientKeyApplied
+            ? `Using ${AMBIENT_KEY_NAME} key from ${OPENCODE_KEY_ENV}.`
+            : "No keys configured. Use /opencode add <name> <key>.";
+        return `${keyStatus}\n${policyStatus}\n${watchdogStatus}`;
     }
     const cdMs = getCooldownMs(config);
     return `${config.keys.map((key, i) => {
@@ -671,6 +676,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
         let usageStatusKeyIndex;
         let usageStatusFetchedAt = 0;
         let usageStatusInFlight;
+        let ambientKey;
         const statusTimerApi = options.timers ?? {
             setTimeout: (callback, ms) => globalThis.setTimeout(callback, ms),
             clearTimeout: (timer) => globalThis.clearTimeout(timer),
@@ -694,6 +700,21 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 configError = formatConfigError(error);
                 return false;
             }
+        }
+        async function resolveEnvKey(ctx) {
+            const envKey = process.env[OPENCODE_KEY_ENV]?.trim();
+            if (!envKey)
+                return undefined;
+            const resolved = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER);
+            return resolved === undefined || resolved === envKey ? envKey : undefined;
+        }
+        function getAmbientUsageTarget() {
+            return ambientKey
+                ? { keyIndex: -1, keyName: AMBIENT_KEY_NAME, bearerToken: ambientKey }
+                : undefined;
+        }
+        function getStatusUsageTarget(current) {
+            return getActiveUsageTarget(current) ?? getAmbientUsageTarget();
         }
         function mutateSharedConfig(mutator) {
             try {
@@ -781,7 +802,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 return;
             if (!refreshConfig())
                 return;
-            const target = getActiveUsageTarget(config);
+            const target = getStatusUsageTarget(config);
             if (!target) {
                 setUsageStatus("opencode-go: no keys configured");
                 return;
@@ -799,9 +820,9 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 usageStatusFetchedAt = receivedAt;
                 if (usageStatusCtx !== ctx)
                     return;
-                if (!refreshConfig() || getActiveUsageTarget(config)?.keyIndex !== target.keyIndex)
+                if (!refreshConfig() || getStatusUsageTarget(config)?.bearerToken !== target.bearerToken)
                     return;
-                if (allowsQuotaRotation(config) && usage.ok && hasExhaustedWindow(usage) && getQuotaBlockedUntil(config, target.keyIndex, receivedAt) === undefined) {
+                if (target.keyIndex >= 0 && allowsQuotaRotation(config) && usage.ok && hasExhaustedWindow(usage) && getQuotaBlockedUntil(config, target.keyIndex, receivedAt) === undefined) {
                     mutateSharedConfig((freshConfig) => {
                         if (!matchesUsageTarget(freshConfig, target))
                             return;
@@ -1043,6 +1064,9 @@ export function createOpencodeGoRotationExtension(options = {}) {
         async function promptAuthImport(ctx) {
             if (!ctx.hasUI || config.keys.length > 0 || config.authImportDeclined)
                 return false;
+            ambientKey ??= await resolveEnvKey(ctx);
+            if (ambientKey)
+                return false;
             const authKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER);
             if (!authKey)
                 return false;
@@ -1069,12 +1093,18 @@ export function createOpencodeGoRotationExtension(options = {}) {
             usageStatusCtx = ctx;
             if (!ensureConfig(ctx))
                 return;
+            ambientKey = config.keys.length === 0 ? await resolveEnvKey(ctx) : undefined;
             if (event.reason === "reload") {
                 applySynchronizedActiveKey(ctx);
                 syncUsageStatus(ctx, true);
                 return;
             }
             if (config.keys.length === 0) {
+                if (ambientKey) {
+                    ctx.ui.notify(`OpenCode: Using ${AMBIENT_KEY_NAME} key from ${OPENCODE_KEY_ENV}. Run /opencode add to store a managed copy.`, "info");
+                    syncUsageStatus(ctx, true);
+                    return;
+                }
                 ctx.ui.notify("OpenCode: No keys configured. Run /opencode to add or import keys.", "warning");
                 setUsageStatus(undefined);
                 return;
@@ -1353,6 +1383,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
             handler: async (args, ctx) => {
                 if (!ensureConfig(ctx))
                     return;
+                ambientKey = config.keys.length === 0 ? ambientKey ?? await resolveEnvKey(ctx) : undefined;
                 const parts = args.trim().split(/\s+/);
                 const subcommand = parts[0] || "";
                 const indexArg = parseInt(parts[1] ?? "", 10);
@@ -1366,7 +1397,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
                                 ctx.ui.notify(`OpenCode: Imported key from auth.json → ${importedName}`, "info");
                         }
                         if (ctx.mode !== "tui") {
-                            ctx.ui.notify(formatStatus(config, now()), "info");
+                            ctx.ui.notify(formatStatus(config, now(), ambientKey !== undefined), "info");
                             break;
                         }
                         const result = await openOpencodeConfig(ctx);
@@ -1384,7 +1415,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
                     case "status":
                     case "list":
                     case "ls": {
-                        const status = formatStatus(config, now());
+                        const status = formatStatus(config, now(), ambientKey !== undefined);
                         ctx.ui.notify(status, "info");
                         break;
                     }
@@ -1396,7 +1427,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
                     case "usage":
                     case "quota": {
                         applySynchronizedActiveKey(ctx);
-                        const usage = await fetchOpenCodeGoUsage(getActiveUsageTarget(config), fetchApi, options.timers);
+                        const usage = await fetchOpenCodeGoUsage(getStatusUsageTarget(config), fetchApi, options.timers);
                         ctx.ui.notify(formatUsageStatus(usage), usage.ok ? "info" : "warning");
                         break;
                     }
@@ -1646,6 +1677,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
             stopUsageStatusTimer();
             setUsageStatus(undefined);
             usageStatusCtx = undefined;
+            ambientKey = undefined;
             cleanupLifecycleState();
         });
     };

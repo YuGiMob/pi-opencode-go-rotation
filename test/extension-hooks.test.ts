@@ -203,7 +203,9 @@ async function withTempConfig(run: (configPath: string) => Promise<void>): Promi
 	const dir = mkdtempSync(join(tmpdir(), "opencode-rotation-test-"));
 	const configPath = join(dir, "opencode-keys.json");
 	const previousConfigPath = process.env.PI_OPENCODE_ROTATION_CONFIG;
+	const previousEnvKey = process.env.OPENCODE_API_KEY;
 	process.env.PI_OPENCODE_ROTATION_CONFIG = configPath;
+	delete process.env.OPENCODE_API_KEY;
 	writeConfig(configPath);
 	try {
 		await run(configPath);
@@ -213,6 +215,8 @@ async function withTempConfig(run: (configPath: string) => Promise<void>): Promi
 		} else {
 			process.env.PI_OPENCODE_ROTATION_CONFIG = previousConfigPath;
 		}
+		if (previousEnvKey === undefined) delete process.env.OPENCODE_API_KEY;
+		else process.env.OPENCODE_API_KEY = previousEnvKey;
 		rmSync(dir, { recursive: true, force: true });
 		release();
 	}
@@ -1744,5 +1748,55 @@ test("quota-only policy blocks an unparseable fixed-window error without rotatin
 		assert.deepEqual(state.runtimeKeys, ["sk-one"]);
 		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], 3_600_000);
 		assert.match(state.notifications.join("\n"), /no reset time was reported/);
+	});
+});
+
+test("an OPENCODE_API_KEY env key is recognized without being persisted", async () => {
+	await withTempConfig(async (configPath) => {
+		writeFileSync(configPath, JSON.stringify({ keys: [] }), { mode: 0o600 });
+		const tokens: string[] = [];
+		const fetch: FetchApi = async (_url, init) => {
+			tokens.push((init.headers.Authorization ?? "").replace(/^Bearer\s+/, ""));
+			return usageResponse([{ name: "weekly", status: "active", usagePercent: 40 }]);
+		};
+		const { pi, ctx, state } = createHarness("authStorage", fetch, true);
+		process.env.OPENCODE_API_KEY = "sk-env";
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		assert.deepEqual(tokens, ["sk-env"]);
+		assert.deepEqual(state.runtimeKeys, []);
+		assert.deepEqual(readConfig(configPath).keys, []);
+		assert.deepEqual(state.statuses.at(-1), { key: "opencode-go-usage", text: "env: wk 40%" });
+		assert.match(state.notifications.join("\n"), /Using env key from OPENCODE_API_KEY/);
+		assert.doesNotMatch(state.notifications.join("\n"), /No keys configured/);
+	});
+});
+
+test("status, usage, and the auth import prompt respect the ambient env key", async () => {
+	await withTempConfig(async (configPath) => {
+		writeFileSync(configPath, JSON.stringify({ keys: [] }), { mode: 0o600 });
+		const tokens: string[] = [];
+		const fetch: FetchApi = async (_url, init) => {
+			tokens.push((init.headers.Authorization ?? "").replace(/^Bearer\s+/, ""));
+			return usageResponse([{ name: "weekly", status: "active", usagePercent: 40 }]);
+		};
+		const { pi, ctx, state } = createHarness("authStorage", fetch, true);
+		state.authKey = "sk-env";
+		process.env.OPENCODE_API_KEY = "sk-env";
+
+		await pi.runCommand("opencode", "status", ctx);
+		assert.match(state.notifications.at(-1) ?? "", /Using env key from OPENCODE_API_KEY/);
+
+		await pi.runCommand("opencode", "usage", ctx);
+		assert.equal(tokens.at(-1), "sk-env");
+		assert.match(state.notifications.at(-1) ?? "", /OpenCode usage for env/);
+
+		await pi.runCommand("opencode", "", ctx);
+		assert.equal(state.confirmations.length, 0);
+		assert.equal(readConfig(configPath).keys.length, 0);
+		assert.equal(readConfig(configPath).authImportDeclined, undefined);
+		assert.match(state.notifications.join("\n"), /Using env key from OPENCODE_API_KEY/);
 	});
 });
