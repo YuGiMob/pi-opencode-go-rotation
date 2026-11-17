@@ -4,7 +4,8 @@ import { formatDuration, formatResetIn } from "./format-time.js";
 export { formatResetIn };
 const PROVIDER = "opencode-go";
 const OPENCODE_KEY_ENV = "OPENCODE_API_KEY";
-const AMBIENT_KEY_NAME = "env";
+const AMBIENT_ENV_KEY_NAME = "env";
+const AMBIENT_AUTH_KEY_NAME = "auth";
 const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 const OPENCODE_GO_USAGE_TIMEOUT_MS = 10_000;
 const FIXED_WINDOW_QUOTA_RE = /\b(?:5[- ]hour|weekly|monthly)\b[\s\S]*\b(?:usage\s+)?(?:quota|limit)\b|\b(?:usage|plan)\s+allocated\s+quota\s+exceeded\b|\b(?:quota|limit)\b[\s\S]*\b(?:will\s+reset|resets?\s+at|fixed[- ]window)\b/i;
@@ -613,13 +614,15 @@ function usageWindowPercent(window) {
         return (window.used / window.limit) * 100;
     return undefined;
 }
-function formatStatus(config, now = Date.now(), ambientKeyApplied = false) {
+function formatStatus(config, now = Date.now(), ambientKeyName) {
     const watchdogStatus = `Watchdog: ${config.watchdogEnabled ? "on" : "off"} (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)`;
     const policyStatus = `Rotation: ${config.rotationPolicy} (candidate verification ${config.verifyCandidates ? "on" : "off"})`;
     if (config.keys.length === 0) {
-        const keyStatus = ambientKeyApplied
-            ? `Using ${AMBIENT_KEY_NAME} key from ${OPENCODE_KEY_ENV}.`
-            : "No keys configured. Use /opencode add <name> <key>.";
+        const keyStatus = ambientKeyName === AMBIENT_ENV_KEY_NAME
+            ? `Using ${AMBIENT_ENV_KEY_NAME} key from ${OPENCODE_KEY_ENV}.`
+            : ambientKeyName === AMBIENT_AUTH_KEY_NAME
+                ? "Using auth key from auth.json."
+                : "No keys configured. Use /opencode add <name> <key>.";
         return `${keyStatus}\n${policyStatus}\n${watchdogStatus}`;
     }
     const cdMs = getCooldownMs(config);
@@ -674,6 +677,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
         let usageStatusTimer;
         let usageStatusDebounce;
         let usageStatusKeyIndex;
+        let usageStatusBearerToken;
         let usageStatusFetchedAt = 0;
         let usageStatusInFlight;
         let ambientKey;
@@ -701,16 +705,19 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 return false;
             }
         }
-        async function resolveEnvKey(ctx) {
-            const envKey = process.env[OPENCODE_KEY_ENV]?.trim();
-            if (!envKey)
+        async function resolveAmbientKey(ctx, current) {
+            if (current.keys.length > 0)
                 return undefined;
             const resolved = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER);
-            return resolved === undefined || resolved === envKey ? envKey : undefined;
+            const envKey = process.env[OPENCODE_KEY_ENV]?.trim();
+            if (envKey && (resolved === undefined || resolved === envKey)) {
+                return { name: AMBIENT_ENV_KEY_NAME, key: envKey };
+            }
+            return resolved ? { name: AMBIENT_AUTH_KEY_NAME, key: resolved } : undefined;
         }
         function getAmbientUsageTarget() {
             return ambientKey
-                ? { keyIndex: -1, keyName: AMBIENT_KEY_NAME, bearerToken: ambientKey }
+                ? { keyIndex: -1, keyName: ambientKey.name, bearerToken: ambientKey.key }
                 : undefined;
         }
         function getStatusUsageTarget(current) {
@@ -802,13 +809,14 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 return;
             if (!refreshConfig())
                 return;
+            ambientKey = config.keys.length === 0 ? await resolveAmbientKey(ctx, config) : undefined;
             const target = getStatusUsageTarget(config);
             if (!target) {
                 setUsageStatus("opencode-go: no keys configured");
                 return;
             }
             const currentTime = now();
-            const keyChanged = target.keyIndex !== usageStatusKeyIndex;
+            const keyChanged = target.keyIndex !== usageStatusKeyIndex || target.bearerToken !== usageStatusBearerToken;
             if (!force && !keyChanged && currentTime - usageStatusFetchedAt < USAGE_STATUS_REFRESH_MS)
                 return;
             if (usageStatusInFlight)
@@ -817,6 +825,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 const usage = await fetchOpenCodeGoUsage(target, fetchApi, options.timers);
                 const receivedAt = now();
                 usageStatusKeyIndex = target.keyIndex;
+                usageStatusBearerToken = target.bearerToken;
                 usageStatusFetchedAt = receivedAt;
                 if (usageStatusCtx !== ctx)
                     return;
@@ -1064,15 +1073,19 @@ export function createOpencodeGoRotationExtension(options = {}) {
         async function promptAuthImport(ctx) {
             if (!ctx.hasUI || config.keys.length > 0 || config.authImportDeclined)
                 return false;
-            ambientKey ??= await resolveEnvKey(ctx);
-            if (ambientKey)
+            ambientKey = await resolveAmbientKey(ctx, config);
+            if (ambientKey?.name === AMBIENT_ENV_KEY_NAME)
                 return false;
             const authKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER);
             if (!authKey)
                 return false;
             const confirmed = await ctx.ui.confirm("OpenCode Go key found", "An OpenCode Go API key exists in auth.json. Import it into the rotation config?");
-            if (confirmed === true)
-                return await importAuthKey(authKey);
+            if (confirmed === true) {
+                const imported = await importAuthKey(authKey);
+                if (imported)
+                    ambientKey = undefined;
+                return imported;
+            }
             const persisted = mutateSharedConfig((freshConfig) => {
                 freshConfig.authImportDeclined = true;
                 return true;
@@ -1093,7 +1106,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
             usageStatusCtx = ctx;
             if (!ensureConfig(ctx))
                 return;
-            ambientKey = config.keys.length === 0 ? await resolveEnvKey(ctx) : undefined;
+            ambientKey = config.keys.length === 0 ? await resolveAmbientKey(ctx, config) : undefined;
             if (event.reason === "reload") {
                 applySynchronizedActiveKey(ctx);
                 syncUsageStatus(ctx, true);
@@ -1101,7 +1114,10 @@ export function createOpencodeGoRotationExtension(options = {}) {
             }
             if (config.keys.length === 0) {
                 if (ambientKey) {
-                    ctx.ui.notify(`OpenCode: Using ${AMBIENT_KEY_NAME} key from ${OPENCODE_KEY_ENV}. Run /opencode add to store a managed copy.`, "info");
+                    const message = ambientKey.name === AMBIENT_ENV_KEY_NAME
+                        ? `OpenCode: Using ${AMBIENT_ENV_KEY_NAME} key from ${OPENCODE_KEY_ENV}. Run /opencode add to store a managed copy.`
+                        : "OpenCode: Using auth key from auth.json. Run /opencode to import it into rotation.";
+                    ctx.ui.notify(message, "info");
                     syncUsageStatus(ctx, true);
                     return;
                 }
@@ -1383,7 +1399,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
             handler: async (args, ctx) => {
                 if (!ensureConfig(ctx))
                     return;
-                ambientKey = config.keys.length === 0 ? ambientKey ?? await resolveEnvKey(ctx) : undefined;
+                ambientKey = config.keys.length === 0 ? await resolveAmbientKey(ctx, config) : undefined;
                 const parts = args.trim().split(/\s+/);
                 const subcommand = parts[0] || "";
                 const indexArg = parseInt(parts[1] ?? "", 10);
@@ -1397,7 +1413,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
                                 ctx.ui.notify(`OpenCode: Imported key from auth.json → ${importedName}`, "info");
                         }
                         if (ctx.mode !== "tui") {
-                            ctx.ui.notify(formatStatus(config, now(), ambientKey !== undefined), "info");
+                            ctx.ui.notify(formatStatus(config, now(), ambientKey?.name), "info");
                             break;
                         }
                         const result = await openOpencodeConfig(ctx);
@@ -1415,7 +1431,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
                     case "status":
                     case "list":
                     case "ls": {
-                        const status = formatStatus(config, now(), ambientKey !== undefined);
+                        const status = formatStatus(config, now(), ambientKey?.name);
                         ctx.ui.notify(status, "info");
                         break;
                     }
@@ -1427,6 +1443,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
                     case "usage":
                     case "quota": {
                         applySynchronizedActiveKey(ctx);
+                        ambientKey = config.keys.length === 0 ? await resolveAmbientKey(ctx, config) : undefined;
                         const usage = await fetchOpenCodeGoUsage(getStatusUsageTarget(config), fetchApi, options.timers);
                         ctx.ui.notify(formatUsageStatus(usage), usage.ok ? "info" : "warning");
                         break;
@@ -1503,6 +1520,27 @@ export function createOpencodeGoRotationExtension(options = {}) {
                         if (count === 1)
                             applyActiveKey(config, ctx.modelRegistry, now());
                         ctx.ui.notify(`Added "${name}" (${count} keys)`, "info");
+                        syncUsageStatus(ctx, true);
+                        break;
+                    }
+                    case "import": {
+                        const authKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER);
+                        if (!authKey) {
+                            ctx.ui.notify("OpenCode: no auth.json key found for opencode-go.", "warning");
+                            return;
+                        }
+                        invalidateAutomaticDecisions();
+                        const imported = await importAuthKey(authKey);
+                        if (!imported) {
+                            if (configError)
+                                ctx.ui.notify(`OpenCode: ${configError}.`, "error");
+                            else
+                                ctx.ui.notify("OpenCode: that auth.json key is already configured.", "info");
+                            return;
+                        }
+                        ambientKey = undefined;
+                        const importedName = applyActiveKey(config, ctx.modelRegistry, now()) ?? "auth";
+                        ctx.ui.notify(`OpenCode: Imported key from auth.json → ${importedName}`, "info");
                         syncUsageStatus(ctx, true);
                         break;
                     }
@@ -1658,7 +1696,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
                         break;
                     }
                     default:
-                        ctx.ui.notify("Usage: /opencode [config|status|usage|quota|events|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|policy [off|quota-only|full]|verify <on|off>|watchdog [status|on|off|<seconds>]]", "info");
+                        ctx.ui.notify("Usage: /opencode [config|status|usage|quota|events|use <n>|next|add <name> <key>|import|rm <n>|reset|cooldown <min>|policy [off|quota-only|full]|verify <on|off>|watchdog [status|on|off|<seconds>]]", "info");
                 }
             },
         });

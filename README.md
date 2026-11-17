@@ -24,7 +24,9 @@ The first key added becomes active immediately.
 
 If `OPENCODE_API_KEY` is set in the environment and no keys are configured, the extension recognizes it as an unmanaged `env` key: it reports that key's usage and keeps the footer working, but never writes it to the config file. Pi already uses that variable for its own requests, so nothing changes about how the model is called. `/opencode add` stores a managed copy that participates in rotation.
 
-The extension never imports keys from `auth.json` automatically. When no keys are configured, `/opencode` offers to import the auth.json key once; declining is remembered and it is not asked again.
+The extension never imports keys from `auth.json` automatically. When no keys are configured, it observes the credential pi resolves from `auth.json` as an unmanaged `auth` key, so status, usage, and the footer work without writing it to the config file. It does not participate in rotation until imported.
+
+`/opencode` offers to import the `auth.json` key once. Declining is remembered, and the observed `auth` key keeps working. Run `/opencode import` to import it later without the prompt.
 
 ## Interactive key manager
 
@@ -42,7 +44,7 @@ Changes are saved as soon as they are confirmed. Outside interactive mode the co
 
 ## How it works
 
-The extension sets the active key as a runtime override, which takes priority over `OPENCODE_API_KEY` environment variables and `auth.json` credentials. When no keys are configured, the environment key is only observed (as `env`) and never overridden or persisted.
+The extension sets the active key as a runtime override, which takes priority over `OPENCODE_API_KEY` environment variables and `auth.json` credentials. When no keys are configured, the environment key and an `auth.json` credential are only observed (as `env` and `auth`) and never overridden or persisted.
 
 Automatic rotation is governed by `rotationPolicy`:
 
@@ -79,18 +81,19 @@ personal: wk 40% · mo 55% | ↻ Nov 12
 ```
 The rolling 5-hour window is omitted from the footer.
 
-It refreshes on session start, model changes, turns, key rotations, manual key commands, and every 5 minutes. Under `quota-only` and `full`, a window at 100% or rate-limited blocks the active key until the window's reset and the next request moves to another key; under `off` the footer reports the window without changing keys. The active key's name leads the line, and switching to another provider clears it.
+It refreshes on session start, model changes, turns, key rotations, manual key commands, and every 5 minutes. Under `quota-only` and `full`, a window at 100% or rate-limited blocks the active key until the window's reset and the next request moves to another key; under `off` the footer reports the window without changing keys. The key name — or `env`/`auth` for an unmanaged key — leads the line, and switching to another provider clears it.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `/opencode` or `/opencode config` | Open the interactive key manager |
-| `/opencode status` | Show all keys, active key marker, cooldown and quota-blocked status, or the `env` key when only `OPENCODE_API_KEY` is set |
+| `/opencode status` | Show all keys, active key marker, cooldown and quota-blocked status, or the unmanaged `env`/`auth` key when no managed keys are configured |
 | `/opencode usage` or `/opencode quota` | Fetch OpenCode Go usage for the active key without showing key material |
 | `/opencode use <n>` | Switch to key number `n` (1-based) and clear its cooldown and quota block |
 | `/opencode next` | Advance to the next configured key and clear its cooldown and quota block before activating it |
 | `/opencode add <name> <key>` | Add a new key |
+| `/opencode import` | Import the `auth.json` key into the config even after a declined prompt |
 | `/opencode rm <n>` | Remove key number `n` |
 | `/opencode reset` | Clear all cooldowns and quota blocks |
 | `/opencode cooldown <min>` | Set or view cooldown duration in minutes |
@@ -146,7 +149,7 @@ Set `maxRetries` to at least the number of keys so all keys get a chance before 
 - Recorded blocks are never re-probed before their stored reset, so there is no plan-top-up recovery; use `/opencode reset` or `/opencode use <n>` to clear a block early.
 - Go plan usage limits are tied to the subscription workspace; multiple keys from one workspace should not be assumed to provide independent quota. See the [OpenCode Go documentation](https://opencode.ai/docs/go/).
 - Keys added via `/opencode add` are stored in plaintext. The config file is created and maintained with `0600` permissions.
-- An `OPENCODE_API_KEY` environment key is never stored, so it cannot rotate and is not remembered across sessions; `/opencode add` creates a managed copy. A stored `auth.json` credential takes precedence over the environment variable, and the extension follows the credential pi resolves.
+- An unmanaged `env` or `auth` key is never stored, so it cannot rotate and is not remembered as a managed key; `/opencode add` stores a managed copy, and `/opencode import` stores the `auth.json` credential. A stored `auth.json` credential takes precedence over the environment variable, and the extension follows the credential pi resolves.
 
 ## License
 

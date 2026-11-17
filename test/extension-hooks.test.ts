@@ -1543,7 +1543,7 @@ test("/opencode without a subcommand falls back to status outside TUI mode", asy
 	});
 });
 
-test("session start never imports auth.json keys automatically", async () => {
+test("session start observes an auth.json key without importing it", async () => {
 	await withTempConfig(async (configPath) => {
 		writeFileSync(configPath, JSON.stringify({ keys: [] }), { mode: 0o600 });
 		const { pi, ctx, state } = createHarness("authStorage", undefined, true);
@@ -1554,7 +1554,8 @@ test("session start never imports auth.json keys automatically", async () => {
 
 		assert.deepEqual(state.runtimeKeys, []);
 		assert.equal(state.confirmations.length, 0);
-		assert.match(state.notifications.join("\n"), /No keys configured/);
+		assert.match(state.notifications.join("\n"), /Using auth key from auth\.json/);
+		assert.doesNotMatch(state.notifications.join("\n"), /No keys configured/);
 		assert.equal(readConfig(configPath).authImportDeclined, undefined);
 	});
 });
@@ -1593,6 +1594,38 @@ test("/opencode remembers a declined auth.json import", async () => {
 	});
 });
 
+test("/opencode import stores the auth.json key after a declined prompt", async () => {
+	await withTempConfig(async (configPath) => {
+		writeFileSync(configPath, JSON.stringify({ keys: [] }), { mode: 0o600 });
+		const { pi, ctx, state } = createHarness("authStorage", undefined, true);
+		state.authKey = "sk-auth";
+		state.confirmAnswer = false;
+
+		await pi.runCommand("opencode", "", ctx);
+		assert.equal(readConfig(configPath).authImportDeclined, true);
+		assert.equal(state.confirmations.length, 1);
+
+		await pi.runCommand("opencode", "import", ctx);
+
+		assert.equal(state.confirmations.length, 1);
+		assert.deepEqual(readConfig(configPath).keys, [{ name: "auth", key: "sk-auth" }]);
+		assert.equal(state.runtimeKeys.at(-1), "sk-auth");
+		assert.match(state.notifications.join("\n"), /Imported key from auth\.json/);
+	});
+});
+
+test("/opencode import reports a missing auth.json key", async () => {
+	await withTempConfig(async (configPath) => {
+		writeFileSync(configPath, JSON.stringify({ keys: [] }), { mode: 0o600 });
+		const { pi, ctx, state } = createHarness("authStorage", undefined, true);
+
+		await pi.runCommand("opencode", "import", ctx);
+
+		assert.deepEqual(readConfig(configPath).keys, []);
+		assert.match(state.notifications.at(-1) ?? "", /no auth\.json key found/);
+	});
+});
+
 test("/opencode does not prompt for auth.json keys without a UI", async () => {
 	await withTempConfig(async (configPath) => {
 		writeFileSync(configPath, JSON.stringify({ keys: [] }), { mode: 0o600 });
@@ -1604,6 +1637,59 @@ test("/opencode does not prompt for auth.json keys without a UI", async () => {
 
 		assert.equal(state.confirmations.length, 0);
 		assert.deepEqual(state.runtimeKeys, []);
+	});
+});
+
+test("an auth.json key feeds status, usage, and the footer without being imported", async () => {
+	await withTempConfig(async (configPath) => {
+		writeFileSync(configPath, JSON.stringify({ keys: [] }), { mode: 0o600 });
+		const tokens: string[] = [];
+		const fetch: FetchApi = async (_url, init) => {
+			tokens.push((init.headers.Authorization ?? "").replace(/^Bearer\s+/, ""));
+			return usageResponse([{ name: "weekly", status: "active", usagePercent: 40 }]);
+		};
+		const { pi, ctx, state } = createHarness("authStorage", fetch, true);
+		state.authKey = "sk-auth";
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		assert.deepEqual(tokens, ["sk-auth"]);
+		assert.deepEqual(state.runtimeKeys, []);
+		assert.deepEqual(readConfig(configPath).keys, []);
+		assert.deepEqual(state.statuses.at(-1), { key: "opencode-go-usage", text: "auth: wk 40%" });
+		assert.match(state.notifications.join("\n"), /Using auth key from auth\.json/);
+
+		await pi.runCommand("opencode", "status", ctx);
+		assert.match(state.notifications.at(-1) ?? "", /Using auth key from auth\.json/);
+
+		await pi.runCommand("opencode", "usage", ctx);
+		assert.equal(tokens.at(-1), "sk-auth");
+		assert.match(state.notifications.at(-1) ?? "", /OpenCode usage for auth/);
+	});
+});
+
+test("a login after session start is picked up by the next footer refresh", async () => {
+	await withTempConfig(async (configPath) => {
+		writeFileSync(configPath, JSON.stringify({ keys: [] }), { mode: 0o600 });
+		const tokens: string[] = [];
+		const fetch: FetchApi = async (_url, init) => {
+			tokens.push((init.headers.Authorization ?? "").replace(/^Bearer\s+/, ""));
+			return usageResponse([{ name: "weekly", status: "active", usagePercent: 40 }]);
+		};
+		const { pi, ctx, state } = createHarness("authStorage", fetch, true);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.deepEqual(tokens, []);
+		assert.deepEqual(state.statuses.at(-1), { key: "opencode-go-usage", text: undefined });
+
+		state.authKey = "sk-auth";
+		await pi.emit("model_select", {}, ctx);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		assert.deepEqual(tokens, ["sk-auth"]);
+		assert.deepEqual(state.statuses.at(-1), { key: "opencode-go-usage", text: "auth: wk 40%" });
 	});
 });
 
