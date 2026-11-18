@@ -1,6 +1,6 @@
 export declare const CONFIG_PATH_ENV = "PI_OPENCODE_ROTATION_CONFIG";
 export declare const DEFAULT_COOLDOWN_MINUTES = 60;
-export declare const DEFAULT_WATCHDOG_IDLE_MS = 90000;
+export declare const DEFAULT_WATCHDOG_IDLE_MS = 300000;
 export type RotationPolicy = "off" | "quota-only" | "full";
 export interface KeyEntry {
     name: string;

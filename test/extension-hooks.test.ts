@@ -68,6 +68,7 @@ interface CommandRegistration {
 class FakePi {
 	readonly handlers: Record<string, EventHandler> = {};
 	readonly commands: Record<string, CommandRegistration> = {};
+	readonly sentMessages: Array<{ message: unknown; options?: { triggerTurn?: boolean } }> = [];
 
 	on(event: string, handler: EventHandler): void {
 		this.handlers[event] = handler;
@@ -75,6 +76,10 @@ class FakePi {
 
 	registerCommand(name: string, command: CommandRegistration): void {
 		this.commands[name] = command;
+	}
+
+	sendMessage(message: unknown, options?: { triggerTurn?: boolean }): void {
+		this.sentMessages.push({ message, options });
 	}
 
 	async emit(event: string, payload: unknown, ctx: ExtensionContext): Promise<unknown> {
@@ -98,6 +103,7 @@ interface FakeContextState {
 	authKey?: string;
 	confirmAnswer?: boolean;
 	readonly confirmations: string[];
+	settings?: Record<string, unknown>;
 }
 
 function createContext(state: FakeContextState, registryShape: "authStorage" | "runtime" = "authStorage", withUi = false): ExtensionContext {
@@ -116,6 +122,8 @@ function createContext(state: FakeContextState, registryShape: "authStorage" | "
 			[registryShape]: keyStore,
 		},
 		hasUI: withUi,
+		getSettings: () => state.settings ?? {},
+		isIdle: () => true,
 		ui: {
 			notify: (message: string) => {
 				state.notifications.push(message);
@@ -1884,5 +1892,116 @@ test("status, usage, and the auth import prompt respect the ambient env key", as
 		assert.equal(readConfig(configPath).keys.length, 0);
 		assert.equal(readConfig(configPath).authImportDeclined, undefined);
 		assert.match(state.notifications.join("\n"), /Using env key from OPENCODE_API_KEY/);
+	});
+});
+
+test("a watchdog timeout under quota-only schedules one hidden continuation", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { rotationPolicy: "quota-only" });
+		const { pi, ctx, state, timers, clock } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		clock.advance(90_000);
+		timers.fireAll();
+		await pi.emit("message_end", {
+			message: { role: "assistant", provider: "opencode-go", stopReason: "abort", errorMessage: "" },
+		}, ctx);
+		await pi.emit("agent_end", {}, ctx);
+		await pi.emit("agent_settled", { aborted: true }, ctx);
+		await pi.emit("agent_settled", { aborted: true }, ctx);
+
+		assert.equal(pi.sentMessages.length, 1);
+		assert.deepEqual(pi.sentMessages[0], {
+			message: {
+				customType: "opencode-go-timeout-retry",
+				content: [{ type: "text", text: "Continue." }],
+				display: false,
+			},
+			options: { triggerTurn: true },
+		});
+		assert.deepEqual(state.runtimeKeys, ["sk-one"]);
+		assert.equal(readConfig(configPath).activeKeyIndex, 0);
+		assert.match(state.notifications.join("\n"), /using one; retrying/);
+	});
+});
+
+test("every watchdog stall schedules another continuation without a cap", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx, timers, clock } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		for (let cycle = 1; cycle <= 3; cycle++) {
+			await pi.emit("before_provider_request", {}, ctx);
+			clock.advance(90_000);
+			timers.fireAll();
+			await pi.emit("message_end", {
+				message: { role: "assistant", provider: "opencode-go", stopReason: "abort", errorMessage: "" },
+			}, ctx);
+			await pi.emit("agent_end", {}, ctx);
+			await pi.emit("agent_settled", { aborted: true }, ctx);
+			assert.equal(pi.sentMessages.length, cycle);
+		}
+
+		assert.deepEqual(
+			pi.sentMessages.map((entry) => (entry.message as { customType?: string }).customType),
+			["opencode-go-timeout-retry", "opencode-go-timeout-retry", "opencode-go-timeout-retry"],
+		);
+		assert.deepEqual(
+			pi.sentMessages.map((entry) => entry.options),
+			[{ triggerTurn: true }, { triggerTurn: true }, { triggerTurn: true }],
+		);
+	});
+});
+
+test("a watchdog timeout with every key quota-blocked sends no continuation", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { quotaBlockedUntil: { 0: 9_999_999, 1: 9_999_999, 2: 9_999_999 } });
+		const { pi, ctx, state, timers, clock } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		clock.advance(90_000);
+		timers.fireAll();
+		await pi.emit("message_end", {
+			message: { role: "assistant", provider: "opencode-go", stopReason: "abort", errorMessage: "" },
+		}, ctx);
+		await pi.emit("agent_end", {}, ctx);
+		await pi.emit("agent_settled", { aborted: true }, ctx);
+
+		assert.equal(pi.sentMessages.length, 0);
+		assert.match(state.notifications.join("\n"), /no other key available/);
+	});
+});
+
+test("agent settled without a watchdog timeout sends no continuation", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("agent_settled", { aborted: true }, ctx);
+
+		assert.equal(pi.sentMessages.length, 0);
+	});
+});
+
+test("retry.enabled false disables the watchdog continuation", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { rotationPolicy: "quota-only" });
+		const { pi, ctx, state, timers, clock } = createHarness();
+		state.settings = { retry: { enabled: false } };
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		clock.advance(90_000);
+		timers.fireAll();
+		await pi.emit("message_end", {
+			message: { role: "assistant", provider: "opencode-go", stopReason: "abort", errorMessage: "" },
+		}, ctx);
+		await pi.emit("agent_end", {}, ctx);
+		await pi.emit("agent_settled", { aborted: true }, ctx);
+
+		assert.equal(pi.sentMessages.length, 0);
+		assert.match(state.notifications.join("\n"), /using one\./);
 	});
 });

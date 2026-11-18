@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 export const CONFIG_PATH_ENV = "PI_OPENCODE_ROTATION_CONFIG";
 export const DEFAULT_COOLDOWN_MINUTES = 60;
-export const DEFAULT_WATCHDOG_IDLE_MS = 90_000;
+export const DEFAULT_WATCHDOG_IDLE_MS = 300_000;
 const DEFAULT_ROTATION_POLICY = "quota-only";
 const DEFAULT_VERIFY_CANDIDATES = false;
 const CONFIG_FILE_MODE = 0o600;

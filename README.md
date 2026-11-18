@@ -60,13 +60,13 @@ The extension has three recovery paths:
 
 1. **Usage-verified Go quota exhaustion**: when OpenCode Go returns HTTP 429, the extension sends the active key only to `https://opencode.ai/zen/go/v1/usage`. A key with a `rate-limited` window or a window at 100% is blocked until the latest reported reset, and the next candidate is activated. With `verifyCandidates` enabled, candidate keys are checked the same way before they are selected, so an exhausted key is blocked and skipped instead of being tried. Rotation prefers keys outside transient cooldown, but can clear a cooldown rather than keep using an exhausted key. When every key is quota-blocked, rotation stops and reports the earliest reset instead of cycling.
 2. **Transient limit errors** (`full` only): when the usage endpoint is unavailable, does not report an exhausted window, or does not finish within 10 seconds, the extension aborts a timed-out usage request, marks the current key as on cooldown, and switches to the next key that is not quota-blocked. Under `quota-only` and `off` the key stays active and the extension reports the limit instead of rotating.
-3. **Silent stalls**: when an `opencode-go` provider request has no response or stream activity for the watchdog window, the extension aborts the hung turn and rewrites the abort as a retryable timeout error. It rotates only under `full`; otherwise pi retries the same key.
+3. **Silent stalls**: when an `opencode-go` provider request has no response or stream activity for the watchdog window, the extension aborts the hung turn and, after the run settles, automatically restarts the request through a hidden continuation message. There is no retry cap: every stall schedules another continuation. It rotates under `full`; otherwise the continuation uses the same key. Setting `retry.enabled: false` in pi's settings also disables the continuation.
 
 Checks happen at decision points only: a candidate is verified when `verifyCandidates` is enabled and it is about to be selected, and a key with a recorded block is left alone until its stored reset passes. Normal requests are not pre-checked. With the interactive footer active, the periodic footer refresh also re-checks the active key and, unless `rotationPolicy` is `off`, records a block if a window is full, so the next request can rotate before it fails.
 
 Fixed-window Go plan quota errors reported at message end follow the same policy: a parseable reset timestamp is authoritative; without one, `quota-only` and `off` record the cooldown-length block without rotating, and `full` rotates. A response-hook rotation is deduplicated so the matching message-end error cannot rotate twice.
 
-Pi's built-in auto-retry picks up the new key on the next request.
+Rotations driven by a 429 or a response hook rely on pi's built-in auto-retry and its `retry.maxRetries`. A watchdog abort cannot use that retry because pi skips aborted runs, so the extension schedules its own continuation, with no cap.
 
 Cooldowns default to 60 minutes. Quota blocks expire at their persisted deadline. Manual `/opencode use <n>` and `/opencode next` clear both restrictions on the selected key.
 
@@ -115,7 +115,7 @@ Keys are stored in `~/.pi/agent/opencode-keys.json` with file permissions `0600`
   "activeKeyIndex": 0,
   "cooldownMinutes": 60,
   "watchdogEnabled": true,
-  "watchdogIdleMs": 90000,
+  "watchdogIdleMs": 300000,
   "rotationPolicy": "quota-only",
   "verifyCandidates": false,
   "cooldowns": {},
@@ -137,12 +137,12 @@ Pair with pi's auto-retry for best results. In `~/.pi/agent/settings.json`:
 }
 ```
 
-Set `maxRetries` to at least the number of keys so all keys get a chance before pi gives up.
+Set `maxRetries` to at least the number of keys so all keys get a chance before pi gives up. This applies to 429 and response-hook rotations. The watchdog continuation ignores `maxRetries` and has no cap, so it keeps restarting a silent stall; `retry.enabled: false` turns it off.
 
 ## Limitations
 
 - The watchdog is scoped to the `opencode-go` provider only. Other providers are not aborted, and the watchdog rotates only under `rotationPolicy` `full`.
-- A legitimate long-running request with no stream activity can be treated as stalled and aborted; tune with `/opencode watchdog <seconds>` or disable with `/opencode watchdog off`.
+- The watchdog defaults to a 5-minute idle window. A legitimate long-running request with no stream activity can be treated as stalled and aborted; tune with `/opencode watchdog <seconds>` or disable with `/opencode watchdog off`.
 - Under `quota-only`, a bare 429, an HTTP 401, an unconfirmed usage result, and a watchdog stall never switch keys; the extension reports them and leaves the active key in place. `full` restores the earlier behavior.
 - When all non-quota-blocked keys are transiently cooling down (`full` only), the extension may clear the next eligible key's cooldown. It never automatically clears or force-selects a quota-blocked key.
 - When all keys are quota-blocked, automatic rotation stops on the current runtime key; each key becomes eligible again automatically when its stored reset deadline passes, or immediately after `/opencode reset`.

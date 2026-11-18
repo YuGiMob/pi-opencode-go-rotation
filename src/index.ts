@@ -26,6 +26,8 @@ const USAGE_STATUS_KEY = "opencode-go-usage";
 const USAGE_STATUS_REFRESH_MS = 60_000;
 const USAGE_STATUS_STALE_MS = 300_000;
 const USAGE_STATUS_DEBOUNCE_MS = 2_000;
+const WATCHDOG_RETRY_MESSAGE_TYPE = "opencode-go-timeout-retry";
+const WATCHDOG_RETRY_PROMPT = "Continue.";
 
 function getCooldownMs(config: Config): number {
 	return (config.cooldownMinutes || DEFAULT_COOLDOWN_MINUTES) * 60_000;
@@ -33,6 +35,28 @@ function getCooldownMs(config: Config): number {
 
 function getWatchdogIdleMs(config: Config): number {
 	return config.watchdogIdleMs > 0 ? config.watchdogIdleMs : DEFAULT_WATCHDOG_IDLE_MS;
+}
+
+interface RetrySettingsSource {
+	getSettings?: () => { retry?: { enabled?: boolean } };
+}
+
+function retryEnabled(ctx: RetrySettingsSource): boolean {
+	try {
+		const getSettings = ctx.getSettings;
+		if (typeof getSettings !== "function") return true;
+		const enabled = getSettings.call(ctx).retry?.enabled;
+		return enabled !== false;
+	} catch {
+		return true;
+	}
+}
+
+function hasUsableKey(config: Config, currentTime: number): boolean {
+	if (config.keys.length === 0) return true;
+	const keyIndex = pickAvailableKeyIndex(config, currentTime);
+	if (keyIndex === undefined) return false;
+	return getQuotaBlockedUntil(config, keyIndex, currentTime) === undefined;
 }
 
 export function shouldWatchProvider(provider: string | undefined): boolean {
@@ -831,6 +855,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		let watchdogAbortMessage: string | undefined;
 		let watchdogTimeoutInfo: ProviderTimeoutInfo | undefined;
 		let watchdogRequestTimedOut = false;
+		let watchdogRetryPending = false;
 		let usageDecisionEpoch = 0;
 		let requestRateLimitState: RequestRateLimitState | undefined;
 		const watchdogEvents: WatchdogEvent[] = [];
@@ -1153,7 +1178,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			if (!refreshConfig()) return { rotated: false };
 			const currentTime = now();
 			if (config.keys.length <= 1 || !allowsWatchdogRotation(config)) {
-				return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated: false };
+				return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime) ?? ambientKey?.name, rotated: false };
 			}
 			if (shouldRotateAfterWatchdogTimeout(timeoutInfo, rateLimitAlreadyRotated)) {
 				const previousIndex = config.activeKeyIndex;
@@ -1166,7 +1191,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated: false };
 		}
 
-		function startWatchdog(ctx: Pick<ExtensionContext, "modelRegistry" | "ui" | "abort">): void {
+		function startWatchdog(ctx: Pick<ExtensionContext, "modelRegistry" | "ui" | "abort"> & RetrySettingsSource): void {
 			if (!refreshConfig()) return;
 			applyActiveKey(config, ctx.modelRegistry, now());
 			stopWatchdog();
@@ -1196,11 +1221,16 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 						activeKey: rotation.keyName,
 						...timeoutInfo,
 					});
+					const currentTime = now();
+					const willRetry = rotation.keyName !== undefined && hasUsableKey(config, currentTime) && retryEnabled(ctx);
+					watchdogRetryPending = willRetry;
 					watchdogAbortPending = true;
-					watchdogAbortMessage = rotation.keyName
+					watchdogAbortMessage = willRetry
 						? `OpenCode Go timeout: ${formatTimeoutInfo(timeoutInfo)}; ${rotation.rotated ? "rotated to" : "using"} ${rotation.keyName}; retrying.`
-						: `OpenCode Go timeout: ${formatTimeoutInfo(timeoutInfo)}; no other key available.`;
-					ctx.ui.notify(watchdogAbortMessage, rotation.keyName ? "info" : "warning");
+						: rotation.keyName
+							? `OpenCode Go timeout: ${formatTimeoutInfo(timeoutInfo)}; using ${rotation.keyName}.`
+							: `OpenCode Go timeout: ${formatTimeoutInfo(timeoutInfo)}; no other key available.`;
+					ctx.ui.notify(watchdogAbortMessage, willRetry ? "info" : "warning");
 					ctx.abort();
 				},
 				timers: options.timers,
@@ -1247,6 +1277,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			invalidateAutomaticDecisions();
 			requestRateLimitState = undefined;
 			clearWatchdogTimeoutGuard();
+			watchdogRetryPending = false;
 			setUsageStatus(undefined);
 			stopUsageStatusTimer();
 			usageStatusCtx = ctx;
@@ -1829,11 +1860,28 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			scheduleUsageStatusRefresh(ctx);
 		});
 
+		pi.on("agent_settled", (event, ctx) => {
+			if (!watchdogRetryPending) return;
+			watchdogRetryPending = false;
+			if (!event.aborted || ctx.model?.provider !== PROVIDER || !ctx.isIdle()) return;
+			if (!refreshConfig()) return;
+			if (!hasUsableKey(config, now())) return;
+			pi.sendMessage(
+				{
+					customType: WATCHDOG_RETRY_MESSAGE_TYPE,
+					content: [{ type: "text", text: WATCHDOG_RETRY_PROMPT }],
+					display: false,
+				},
+				{ triggerTurn: true },
+			);
+		});
+
 		pi.on("session_shutdown", () => {
 			stopUsageStatusTimer();
 			setUsageStatus(undefined);
 			usageStatusCtx = undefined;
 			ambientKey = undefined;
+			watchdogRetryPending = false;
 			cleanupLifecycleState();
 		});
 	};
