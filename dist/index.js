@@ -792,7 +792,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
             usageStatusTimer = statusTimerApi.setTimeout(() => {
                 usageStatusTimer = undefined;
                 const ctx = usageStatusCtx;
-                if (!ctx || !ctx.hasUI || !shouldWatchProvider(ctx.model?.provider))
+                if (!ctx || !ctx.hasUI || !config.footerUsageEnabled || !shouldWatchProvider(ctx.model?.provider))
                     return;
                 fireUsageStatusRefresh(ctx);
                 startUsageStatusTimer();
@@ -803,7 +803,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
         }
         function syncUsageStatus(ctx, force = false) {
             usageStatusCtx = ctx;
-            if (shouldWatchProvider(ctx.model?.provider)) {
+            if (config.footerUsageEnabled && shouldWatchProvider(ctx.model?.provider)) {
                 startUsageStatusTimer();
                 fireUsageStatusRefresh(ctx, force);
                 return;
@@ -813,7 +813,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
         }
         function scheduleUsageStatusRefresh(ctx) {
             usageStatusCtx = ctx;
-            if (!shouldWatchProvider(ctx.model?.provider)) {
+            if (!config.footerUsageEnabled || !shouldWatchProvider(ctx.model?.provider)) {
                 stopUsageStatusTimer();
                 setUsageStatus(undefined);
                 return;
@@ -832,6 +832,11 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 return;
             if (!refreshConfig())
                 return;
+            if (!config.footerUsageEnabled) {
+                stopUsageStatusTimer();
+                setUsageStatus(undefined);
+                return;
+            }
             ambientKey = config.keys.length === 0 ? await resolveAmbientKey(ctx, config) : undefined;
             const target = getStatusUsageTarget(config);
             if (!target) {
@@ -852,7 +857,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 usageStatusFetchedAt = receivedAt;
                 if (usageStatusCtx !== ctx)
                     return;
-                if (!refreshConfig() || getStatusUsageTarget(config)?.bearerToken !== target.bearerToken)
+                if (!refreshConfig() || !config.footerUsageEnabled || getStatusUsageTarget(config)?.bearerToken !== target.bearerToken)
                     return;
                 if (target.keyIndex >= 0 && allowsQuotaRotation(config) && usage.ok && hasExhaustedWindow(usage) && getQuotaBlockedUntil(config, target.keyIndex, receivedAt) === undefined) {
                     mutateSharedConfig((freshConfig) => {
@@ -1724,8 +1729,32 @@ export function createOpencodeGoRotationExtension(options = {}) {
                         ctx.ui.notify(`Candidate verification ${enabled ? "enabled" : "disabled"}`, "info");
                         break;
                     }
+                    case "footer": {
+                        const value = parts[1];
+                        if (value === undefined) {
+                            ctx.ui.notify(`Footer usage: ${config.footerUsageEnabled ? "on" : "off"}`, "info");
+                            return;
+                        }
+                        if (value !== "on" && value !== "off") {
+                            ctx.ui.notify(`Usage: /opencode footer <on|off> (currently ${config.footerUsageEnabled ? "on" : "off"})`, "info");
+                            return;
+                        }
+                        const enabled = value === "on";
+                        const result = mutateSharedConfig((freshConfig) => {
+                            freshConfig.footerUsageEnabled = enabled;
+                            return true;
+                        });
+                        if (result !== true) {
+                            if (configError)
+                                ctx.ui.notify(`OpenCode: ${configError}.`, "error");
+                            return;
+                        }
+                        ctx.ui.notify(enabled ? "Footer usage enabled" : "Footer usage disabled", "info");
+                        syncUsageStatus(ctx, true);
+                        break;
+                    }
                     default:
-                        ctx.ui.notify("Usage: /opencode [config|status|usage|quota|events|use <n>|next|add <name> <key>|import|rm <n>|reset|cooldown <min>|policy [off|quota-only|full]|verify <on|off>|watchdog [status|on|off|<seconds>]]", "info");
+                        ctx.ui.notify("Usage: /opencode [config|status|usage|quota|events|use <n>|next|add <name> <key>|import|rm <n>|reset|cooldown <min>|policy [off|quota-only|full]|verify <on|off>|footer [on|off]|watchdog [status|on|off|<seconds>]]", "info");
                 }
             },
         });

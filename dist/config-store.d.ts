@@ -14,6 +14,7 @@ export interface Config {
     watchdogIdleMs: number;
     rotationPolicy: RotationPolicy;
     verifyCandidates: boolean;
+    footerUsageEnabled: boolean;
     cooldowns: Record<number, number>;
     quotaBlockedUntil: Record<number, number>;
     authImportDeclined: boolean;
