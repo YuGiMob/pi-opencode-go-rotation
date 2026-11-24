@@ -20,6 +20,7 @@ export const DEFAULT_COOLDOWN_MINUTES = 60;
 export const DEFAULT_WATCHDOG_IDLE_MS = 300_000;
 const DEFAULT_ROTATION_POLICY: RotationPolicy = "quota-only";
 const DEFAULT_VERIFY_CANDIDATES = false;
+const DEFAULT_FOOTER_USAGE = true;
 
 const CONFIG_FILE_MODE = 0o600;
 const LOCK_TIMEOUT_MS = 10_000;
@@ -41,6 +42,7 @@ export interface Config {
 	watchdogIdleMs: number;
 	rotationPolicy: RotationPolicy;
 	verifyCandidates: boolean;
+	footerUsageEnabled: boolean;
 	cooldowns: Record<number, number>;
 	quotaBlockedUntil: Record<number, number>;
 	authImportDeclined: boolean;
@@ -65,6 +67,7 @@ export function createEmptyConfig(): Config {
 		watchdogIdleMs: DEFAULT_WATCHDOG_IDLE_MS,
 		rotationPolicy: DEFAULT_ROTATION_POLICY,
 		verifyCandidates: DEFAULT_VERIFY_CANDIDATES,
+		footerUsageEnabled: DEFAULT_FOOTER_USAGE,
 		cooldowns: {},
 		quotaBlockedUntil: {},
 		authImportDeclined: false,
@@ -134,6 +137,9 @@ function parseConfig(value: unknown, path: string): Config {
 	const verifyCandidates = value.verifyCandidates ?? DEFAULT_VERIFY_CANDIDATES;
 	if (typeof verifyCandidates !== "boolean") throw new ConfigLoadError(path, "verifyCandidates is invalid");
 
+	const footerUsageEnabled = value.footerUsageEnabled ?? DEFAULT_FOOTER_USAGE;
+	if (typeof footerUsageEnabled !== "boolean") throw new ConfigLoadError(path, "footerUsageEnabled is invalid");
+
 	const authImportDeclined = value.authImportDeclined ?? false;
 	if (typeof authImportDeclined !== "boolean") throw new ConfigLoadError(path, "authImportDeclined is invalid");
 
@@ -145,6 +151,7 @@ function parseConfig(value: unknown, path: string): Config {
 		watchdogIdleMs,
 		rotationPolicy,
 		verifyCandidates,
+		footerUsageEnabled,
 		authImportDeclined,
 		cooldowns: parseNumberRecord(value.cooldowns, "cooldowns", path),
 		quotaBlockedUntil: parseNumberRecord(value.quotaBlockedUntil, "quotaBlockedUntil", path),

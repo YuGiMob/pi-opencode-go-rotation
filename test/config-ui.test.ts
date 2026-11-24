@@ -32,6 +32,7 @@ function fixture(): Config {
 		watchdogIdleMs: 90_000,
 		rotationPolicy: "quota-only",
 		verifyCandidates: false,
+		footerUsageEnabled: true,
 		cooldowns: {},
 		quotaBlockedUntil: {},
 		authImportDeclined: false,
@@ -220,6 +221,7 @@ test("openOpencodeConfig renders the key manager in TUI mode", async () => {
 		assert.match(rendered, /Watchdog/);
 		assert.match(rendered, /Rotation policy/);
 		assert.match(rendered, /Verify candidates/);
+		assert.match(rendered, /Footer usage/);
 		assert.equal(notified, 0);
 	});
 });

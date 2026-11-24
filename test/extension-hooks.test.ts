@@ -168,6 +168,7 @@ function readConfig(path: string): {
 	authImportDeclined?: boolean;
 	rotationPolicy?: string;
 	verifyCandidates?: boolean;
+	footerUsageEnabled?: boolean;
 } {
 	return JSON.parse(readFileSync(path, "utf-8"));
 }
@@ -336,6 +337,61 @@ test("session start publishes footer usage and a model change clears it", async 
 		(ctx as unknown as { model: { provider: string } }).model = { provider: "anthropic" };
 		await pi.emit("model_select", {}, ctx);
 		assert.deepEqual(state.statuses.at(-1), { key: "opencode-go-usage", text: undefined });
+	});
+});
+
+test("footer usage off suppresses the status line and the usage request", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { footerUsageEnabled: false });
+		const tokens: string[] = [];
+		const fetch: FetchApi = async (_url, init) => {
+			tokens.push((init.headers.Authorization ?? "").replace(/^Bearer\s+/, ""));
+			return usageResponse([{ name: "weekly", status: "active", usagePercent: 40 }]);
+		};
+		const { pi, ctx, state } = createHarness("authStorage", fetch, true);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		assert.deepEqual(tokens, []);
+		assert.deepEqual(state.statuses.filter((entry) => entry.text !== undefined), []);
+	});
+});
+
+test("the footer command toggles publishing and persists the setting", async () => {
+	await withTempConfig(async (configPath) => {
+		const fetch: FetchApi = async () => usageResponse([{ name: "weekly", status: "active", usagePercent: 40 }]);
+		const { pi, ctx, state } = createHarness("authStorage", fetch, true);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.deepEqual(state.statuses.at(-1), { key: "opencode-go-usage", text: "one: wk 40%" });
+
+		await pi.runCommand("opencode", "footer off", ctx);
+		assert.deepEqual(state.statuses.at(-1), { key: "opencode-go-usage", text: undefined });
+		assert.equal(readConfig(configPath).footerUsageEnabled, false);
+
+		await pi.runCommand("opencode", "footer on", ctx);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.deepEqual(state.statuses.at(-1), { key: "opencode-go-usage", text: "one: wk 40%" });
+		assert.equal(readConfig(configPath).footerUsageEnabled, true);
+	});
+});
+
+test("the usage command still fetches while footer usage is off", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { footerUsageEnabled: false });
+		const tokens: string[] = [];
+		const fetch: FetchApi = async (_url, init) => {
+			tokens.push((init.headers.Authorization ?? "").replace(/^Bearer\s+/, ""));
+			return usageResponse([{ name: "weekly", status: "active", usagePercent: 40 }]);
+		};
+		const { pi, ctx, state } = createHarness("authStorage", fetch, true);
+
+		await pi.runCommand("opencode", "usage", ctx);
+
+		assert.deepEqual(tokens, ["sk-one"]);
+		assert.match(state.notifications.at(-1) ?? "", /OpenCode usage for one/);
 	});
 });
 

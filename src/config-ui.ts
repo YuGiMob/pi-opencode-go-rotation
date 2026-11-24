@@ -538,6 +538,13 @@ export async function openOpencodeConfig(ctx: Pick<ExtensionCommandContext, "mod
 					description: "Check a candidate key's usage before switching to it.",
 				});
 				items.push({
+					id: "footerUsage",
+					label: "Footer usage",
+					currentValue: current.footerUsageEnabled ? "on" : "off",
+					values: ["on", "off"],
+					description: "Show the active key's OpenCode Go usage in the footer and refresh it periodically.",
+				});
+				items.push({
 					id: "watchdogIdle",
 					label: "Watchdog idle",
 					currentValue: `${Math.ceil(watchdogIdleMs(current) / 1000)}s`,
@@ -624,6 +631,13 @@ export async function openOpencodeConfig(ctx: Pick<ExtensionCommandContext, "mod
 					if (persist((fresh) => {
 						fresh.verifyCandidates = enabled;
 					}) === undefined) rebuild("verifyCandidates");
+				}
+				if (id === "footerUsage") {
+					const enabled = value === "on";
+					if (persist((fresh) => {
+						fresh.footerUsageEnabled = enabled;
+					}) === undefined) rebuild("footerUsage");
+					return;
 				}
 			};
 			rebuild();

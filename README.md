@@ -83,6 +83,8 @@ The rolling 5-hour window is omitted from the footer.
 
 It refreshes on session start, model changes, turns, key rotations, manual key commands, and every 5 minutes. Under `quota-only` and `full`, a window at 100% or rate-limited blocks the active key until the window's reset and the next request moves to another key; under `off` the footer reports the window without changing keys. The key name — or `env`/`auth` for an unmanaged key — leads the line, and switching to another provider clears it.
 
+Running `/opencode footer off` or setting `footerUsageEnabled` to `false` hides the line and stops the periodic refresh, including its pre-emptive quota blocking. `/opencode usage` still fetches usage on demand.
+
 ## Commands
 
 | Command | Description |
@@ -99,6 +101,7 @@ It refreshes on session start, model changes, turns, key rotations, manual key c
 | `/opencode cooldown <min>` | Set or view cooldown duration in minutes |
 | `/opencode policy [off\|quota-only\|full]` | Set or view the automatic rotation policy |
 | `/opencode verify <on\|off>` | Enable or disable candidate usage verification before switching |
+| `/opencode footer [on\|off]` | Show or change the footer usage line |
 | `/opencode events` | Show recent watchdog timeout history (last 10) |
 | `/opencode watchdog [status\|on\|off\|<seconds>]` | Configure silent-stall detection |
 
@@ -118,6 +121,7 @@ Keys are stored in `~/.pi/agent/opencode-keys.json` with file permissions `0600`
   "watchdogIdleMs": 300000,
   "rotationPolicy": "quota-only",
   "verifyCandidates": false,
+  "footerUsageEnabled": true,
   "cooldowns": {},
   "quotaBlockedUntil": {},
   "authImportDeclined": false

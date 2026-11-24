@@ -133,3 +133,26 @@ test("invalid rotation policy and candidate verification are reported", () => {
 		removeDirectory(directory);
 	}
 });
+
+test("footer usage defaults to on when the file omits it and round-trips off", () => {
+	const { directory, path } = makeConfigPath();
+	try {
+		writeFileSync(path, JSON.stringify({ keys: [] }), { mode: 0o600 });
+		assert.equal(loadConfig(path).footerUsageEnabled, true);
+
+		writeConfig({ ...createEmptyConfig(), footerUsageEnabled: false }, path);
+		assert.equal(loadConfig(path).footerUsageEnabled, false);
+	} finally {
+		removeDirectory(directory);
+	}
+});
+
+test("invalid footer usage is reported", () => {
+	const { directory, path } = makeConfigPath();
+	try {
+		writeFileSync(path, JSON.stringify({ keys: [], footerUsageEnabled: "yes" }), { mode: 0o600 });
+		assert.throws(() => loadConfig(path), (error: unknown) => error instanceof ConfigLoadError);
+	} finally {
+		removeDirectory(directory);
+	}
+});
